@@ -204,9 +204,9 @@ rm -f .complete-validator/cache.json
 # 1. 既存のプラグインをアンインストール (未インストールならスキップ)
 /plugin uninstall complete-validator@complete-validator --scope project
 
-# 2. マーケットプレースを削除して再登録 (ソースパスの変更にも対応)
+# 2. マーケットプレースを削除して再登録 (ソースの変更にも対応)
 /plugin marketplace remove complete-validator
-/plugin marketplace add /mnt/c/Users/inoue.akimitsu/git/complete-validator
+/plugin marketplace add inoueakimitsu/complete-validator
 
 # 3. プラグインをインストール
 /plugin install complete-validator@complete-validator --scope project
