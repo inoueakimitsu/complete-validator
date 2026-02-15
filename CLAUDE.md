@@ -74,6 +74,8 @@ complete-validator/
 ├── .claude-plugin/
 │   ├── marketplace.json         # マーケットプレース定義 (配布用)
 │   └── plugin.json              # Plugin メタデータ
+├── git-hooks/
+│   └── pre-push                 # pre-push hook (clone 後に .git/hooks/ へコピー)
 ├── hooks/
 │   └── hooks.json               # PreToolUse hook 設定 (インストール時に自動登録)
 ├── skills/
@@ -266,6 +268,19 @@ rm -rf /tmp/test-cv
 - **MAJOR** — 後方互換性のない変更 (ルールファイルのフォーマット変更など)
 - **MINOR** — 後方互換性のある機能追加
 - **PATCH** — バグ修正
+
+## 開発環境セットアップ
+
+### pre-push hook の設定
+
+clone 後に以下のコマンドで pre-push hook を設定してください。`.git/hooks/` は Git 管理外のため、手動でコピーする必要があります。
+
+```bash
+cp git-hooks/pre-push .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
+```
+
+この hook は push 時にバージョンファイル (`.claude-plugin/marketplace.json`、`.claude-plugin/plugin.json`) の更新漏れをチェックします。バージョンファイル以外の変更が含まれているのにバージョンが更新されていない場合、push をブロックします。
 
 ## 制限事項
 

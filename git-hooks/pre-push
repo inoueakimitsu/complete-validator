@@ -1,0 +1,73 @@
+#!/bin/bash
+# pre-push hook: バージョン更新チェック
+# push 対象のコミットにファイル変更が含まれる場合、
+# .claude-plugin/marketplace.json と .claude-plugin/plugin.json の
+# version が更新されているかチェックする。
+
+remote="$1"
+url="$2"
+
+VERSION_FILES=".claude-plugin/marketplace.json .claude-plugin/plugin.json"
+
+while read local_ref local_sha remote_ref remote_sha; do
+    # 新規ブランチの場合、remote_sha が全てゼロ
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        # 新規ブランチ: main との差分を見る
+        range="$(git merge-base HEAD main 2>/dev/null || echo "")..${local_sha}"
+        if [ "$range" = "..${local_sha}" ]; then
+            # main が見つからない場合は全コミットを対象にする
+            range="$local_sha"
+        fi
+    else
+        range="${remote_sha}..${local_sha}"
+    fi
+
+    # push 対象のコミットで変更されたファイル一覧を取得
+    changed_files=$(git diff --name-only "$range" 2>/dev/null)
+    if [ -z "$changed_files" ]; then
+        continue
+    fi
+
+    # バージョンファイル以外の変更があるかチェック
+    has_non_version_changes=false
+    for file in $changed_files; do
+        is_version_file=false
+        for vf in $VERSION_FILES; do
+            if [ "$file" = "$vf" ]; then
+                is_version_file=true
+                break
+            fi
+        done
+        if [ "$is_version_file" = false ]; then
+            has_non_version_changes=true
+            break
+        fi
+    done
+
+    # バージョンファイルのみの変更なら OK
+    if [ "$has_non_version_changes" = false ]; then
+        continue
+    fi
+
+    # バージョンファイルが変更されているかチェック
+    missing_version_updates=""
+    for vf in $VERSION_FILES; do
+        if ! echo "$changed_files" | grep -q "^${vf}$"; then
+            missing_version_updates="$missing_version_updates  - $vf\n"
+        fi
+    done
+
+    if [ -n "$missing_version_updates" ]; then
+        echo ""
+        echo "ERROR: バージョン更新が必要です。"
+        echo ""
+        echo "以下のファイルの version が更新されていません:"
+        echo -e "$missing_version_updates"
+        echo "機能追加やバグ修正を行った場合は、push 前にバージョンを更新してください。"
+        echo "詳細は CLAUDE.md の「バージョン管理」セクションを参照してください。"
+        echo ""
+        exit 1
+    fi
+done
+
+exit 0
