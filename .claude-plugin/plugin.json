@@ -3,6 +3,5 @@
   "version": "1.2.0",
   "description": "git commit 時に rules/ 内の Markdown ルールに基づく AI スタイルチェックを自動実行するプラグイン",
   "keywords": ["style-check", "linting", "commit-hook", "japanese"],
-  "hooks": "./hooks/hooks.json",
   "license": "MIT"
 }
