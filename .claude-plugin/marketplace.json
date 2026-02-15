@@ -8,7 +8,7 @@
       "name": "complete-validator",
       "source": "./",
       "description": "git commit 時に rules/ 内の Markdown ルールに基づく AI スタイルチェックを自動実行するプラグイン",
-      "version": "1.3.0"
+      "version": "1.3.1"
     }
   ]
 }
