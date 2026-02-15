@@ -2,9 +2,10 @@
 """AI validator using Claude.
 
 Validates files against rules defined in rules/*.md.
-Supports two modes:
+Supports three modes:
   - working (default): validates unstaged changes (for on-demand use)
   - staged (--staged):  validates staged changes (for commit hooks)
+  - full-scan (--full-scan): validates all tracked files (for scanning existing code)
 
 Runs claude -p per rule file in parallel for better detection accuracy.
 Violations are denied (commit blocked) so the agent must fix them.
@@ -51,6 +52,12 @@ def get_changed_files(staged: bool) -> list[str]:
     if staged:
         args.insert(1, "--cached")
     output = run_git(*args)
+    return output.splitlines() if output else []
+
+
+def get_all_tracked_files() -> list[str]:
+    """Get all tracked files via git ls-files."""
+    output = run_git("ls-files")
     return output.splitlines() if output else []
 
 
@@ -226,10 +233,10 @@ def load_suppressions(base_dir: Path) -> str:
         return ""
 
 
-def compute_cache_key(rule_name: str, rule_body: str, diff_for_rule: str, suppressions: str = "") -> str:
+def compute_cache_key(rule_name: str, rule_body: str, diff_for_rule: str, suppressions: str = "", mode: str = "diff") -> str:
     """Compute SHA256 hash for per-rule caching."""
     content = (
-        PROMPT_VERSION
+        PROMPT_VERSION + ":" + mode
         + "\n---RULE_NAME---\n" + rule_name
         + "\n---RULE_BODY---\n" + rule_body
         + "\n---DIFF---\n" + diff_for_rule
@@ -325,18 +332,29 @@ def build_prompt_for_rule(
     files: dict[str, str],
     diff_chunks: dict[str, str],
     suppressions: str = "",
+    full_scan: bool = False,
 ) -> str:
     """Build the prompt for checking a single rule file against its matched files."""
     headings = extract_rule_headings(rule_body)
 
-    parts = [
-        "You are a strict AI validator. You MUST check every rule listed for each file. Do not skip any rule.",
-        "The diff is the primary check target. The full file content is provided for context only.",
-        "If you are uncertain whether something is a violation, report it with a note that it needs confirmation.",
-        "Be specific: state the file, line, and which rule is violated.",
-        "If there are no violations, respond with exactly: 'No violations found.'",
-        "",
-    ]
+    if full_scan:
+        parts = [
+            "You are a strict AI validator. You MUST check every rule listed for each file. Do not skip any rule.",
+            "Check the entire file content against the rules. All code in each file is the check target.",
+            "If you are uncertain whether something is a violation, report it with a note that it needs confirmation.",
+            "Be specific: state the file, line, and which rule is violated.",
+            "If there are no violations, respond with exactly: 'No violations found.'",
+            "",
+        ]
+    else:
+        parts = [
+            "You are a strict AI validator. You MUST check every rule listed for each file. Do not skip any rule.",
+            "The diff is the primary check target. The full file content is provided for context only.",
+            "If you are uncertain whether something is a violation, report it with a note that it needs confirmation.",
+            "Be specific: state the file, line, and which rule is violated.",
+            "If there are no violations, respond with exactly: 'No violations found.'",
+            "",
+        ]
 
     # Rules Checklist
     if headings:
@@ -359,19 +377,24 @@ def build_prompt_for_rule(
         parts.append(f"=== FILE: {file_path} ===")
         parts.append("")
 
-        # Diff for this file (primary check target)
-        parts.append("--- Changes (primary check target) ---")
-        file_diff = diff_chunks.get(file_path, "")
-        if file_diff:
-            parts.append(file_diff)
+        if full_scan:
+            # Full-scan: file content is the primary check target
+            parts.append("--- Full Content (primary check target) ---")
+            parts.append(files[file_path])
+            parts.append("")
         else:
-            parts.append("(no diff available for this file)")
-        parts.append("")
+            # Diff mode: diff is primary, full content for context
+            parts.append("--- Changes (primary check target) ---")
+            file_diff = diff_chunks.get(file_path, "")
+            if file_diff:
+                parts.append(file_diff)
+            else:
+                parts.append("(no diff available for this file)")
+            parts.append("")
 
-        # Full content for context
-        parts.append("--- Full Content (for context) ---")
-        parts.append(files[file_path])
-        parts.append("")
+            parts.append("--- Full Content (for context) ---")
+            parts.append(files[file_path])
+            parts.append("")
 
     # Suppressions
     if suppressions:
@@ -399,6 +422,7 @@ def check_single_rule(
     cache: dict,
     cache_path: Path,
     cache_lock: threading.Lock,
+    full_scan: bool = False,
 ) -> tuple[str, str, str]:
     """Check a single rule file against its matched files.
 
@@ -410,11 +434,16 @@ def check_single_rule(
     if not matched:
         return rule_name, "skip", ""
 
-    # Build diff for this rule's files only
-    diff_for_rule = "".join(diff_chunks.get(f, "") for f in matched)
+    # Build cache key content
+    if full_scan:
+        # Use sorted file contents hash instead of diff
+        contents_for_hash = "".join(files[f] for f in sorted(matched))
+        cache_key = compute_cache_key(rule_name, rule_body, contents_for_hash, suppressions, mode="full-scan")
+    else:
+        diff_for_rule = "".join(diff_chunks.get(f, "") for f in matched)
+        cache_key = compute_cache_key(rule_name, rule_body, diff_for_rule, suppressions)
 
     # Cache check
-    cache_key = compute_cache_key(rule_name, rule_body, diff_for_rule, suppressions)
     with cache_lock:
         if cache_key in cache:
             cached = cache[cache_key]
@@ -423,7 +452,7 @@ def check_single_rule(
 
     # Build prompt and run Claude
     prompt = build_prompt_for_rule(
-        rule_name, rule_body, matched, files, diff_chunks, suppressions,
+        rule_name, rule_body, matched, files, diff_chunks, suppressions, full_scan=full_scan,
     )
 
     try:
@@ -469,10 +498,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="AI validator using Claude."
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--staged",
         action="store_true",
         help="Check staged changes (for commit hooks). Default: check working changes.",
+    )
+    mode_group.add_argument(
+        "--full-scan",
+        action="store_true",
+        help="Check all tracked files regardless of diff (for scanning existing code).",
     )
     parser.add_argument(
         "--plugin-dir",
@@ -486,6 +521,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     staged = args.staged
+    full_scan = args.full_scan
     plugin_dir = args.plugin_dir
 
     # Cache is stored at git toplevel
@@ -493,15 +529,22 @@ def main() -> None:
     cache_dir = Path(git_toplevel) if git_toplevel else Path.cwd()
     cache_path = cache_dir / ".complete-validator" / "cache.json"
 
-    # Get diff
-    diff = get_diff(staged)
-    if not diff:
-        sys.exit(0)
-
-    # Get changed files
-    changed_files = get_changed_files(staged)
-    if not changed_files:
-        sys.exit(0)
+    if full_scan:
+        # Full-scan mode: check all tracked files
+        target_files = get_all_tracked_files()
+        if not target_files:
+            print("No tracked files found.", file=sys.stderr)
+            sys.exit(0)
+        diff_chunks: dict[str, str] = {}
+    else:
+        # Diff-based mode (working or staged)
+        diff = get_diff(staged)
+        if not diff:
+            sys.exit(0)
+        target_files = get_changed_files(staged)
+        if not target_files:
+            sys.exit(0)
+        diff_chunks = split_diff_by_file(diff)
 
     # Load rules: parent directory search + built-in
     project_dirs = find_project_rules_dirs()
@@ -510,18 +553,26 @@ def main() -> None:
 
     # Output warnings for rule files without frontmatter
     if warnings and not rules:
-        output_result("allow", "[Validator]\n" + "\n".join(warnings))
+        if full_scan:
+            print("[Validator]\n" + "\n".join(warnings), file=sys.stderr)
+        else:
+            output_result("allow", "[Validator]\n" + "\n".join(warnings))
         sys.exit(0)
 
     if not rules:
         sys.exit(0)
 
     # Match files to rules (used only for early exit check)
-    file_rules = match_files_to_rules(rules, changed_files)
+    file_rules = match_files_to_rules(rules, target_files)
     if not file_rules:
-        # No changed files match any rule patterns
+        # No files match any rule patterns
         if warnings:
-            output_result("allow", "[Validator]\n" + "\n".join(warnings))
+            if full_scan:
+                print("[Validator]\n" + "\n".join(warnings), file=sys.stderr)
+            else:
+                output_result("allow", "[Validator]\n" + "\n".join(warnings))
+        if full_scan:
+            print("No files match any rule patterns.")
         sys.exit(0)
 
     # Load suppressions (always from git toplevel)
@@ -530,14 +581,14 @@ def main() -> None:
     # Load cache
     cache = load_cache(cache_path)
 
-    # Split diff into per-file chunks
-    diff_chunks = split_diff_by_file(diff)
-
     # Get file contents for matched files
     files: dict[str, str] = {}
     for file_path in file_rules:
         try:
-            content = get_file_content(file_path, staged)
+            if full_scan:
+                content = Path(file_path).read_text(encoding="utf-8")
+            else:
+                content = get_file_content(file_path, staged)
         except (OSError, UnicodeDecodeError):
             continue
         if content:
@@ -547,7 +598,7 @@ def main() -> None:
         sys.exit(0)
 
     # Run checks per rule file in parallel
-    deadline = time.monotonic() + 110  # hook timeout is 120s
+    deadline = time.monotonic() + (3600 if full_scan else 110)  # hook timeout is 120s; full-scan has no hook
     results: list[tuple[str, str, str]] = []
     cache_lock = threading.Lock()
 
@@ -557,8 +608,9 @@ def main() -> None:
             future = executor.submit(
                 check_single_rule,
                 rule_name, rule_body, rule_patterns,
-                changed_files, files, diff_chunks,
+                target_files, files, diff_chunks,
                 suppressions, cache, cache_path, cache_lock,
+                full_scan=full_scan,
             )
             futures[future] = rule_name
 
@@ -598,15 +650,28 @@ def main() -> None:
         all_messages.append("\n[Warning]\n" + "\n".join(warnings))
 
     if not all_messages:
+        if full_scan:
+            print("No violations found.")
         sys.exit(0)
 
     message = "[Validator Result]\n" + "\n\n".join(all_messages)
 
-    if deny_messages:
-        message += "\n\n[Action Required]\nFix the violations above and retry the commit.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and retry.\nRepeat until all violations are resolved."
-        output_result("deny", message)
+    if full_scan:
+        # Full-scan: plain text output + exit code
+        if deny_messages:
+            message += "\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and re-run."
+            print(message, file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(message)
+            sys.exit(0)
     else:
-        output_result("allow", message)
+        # Hook mode: JSON output
+        if deny_messages:
+            message += "\n\n[Action Required]\nFix the violations above and retry the commit.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and retry.\nRepeat until all violations are resolved."
+            output_result("deny", message)
+        else:
+            output_result("allow", message)
 
 
 if __name__ == "__main__":

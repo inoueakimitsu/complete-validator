@@ -35,6 +35,19 @@ python3 scripts/check_style.py --staged
 python3 scripts/check_style.py --plugin-dir /path/to/complete-validator
 ```
 
+## フル スキャン
+
+diff に関係なく、リポジトリ内の全 tracked ファイルをルールに基づいてチェックします。
+ツール導入前にコミットされた既存コードの違反を検出するのに使います。
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+```
+
+- 違反あり → exit code 1、違反内容を stderr に出力します。
+- 違反なし → exit code 0 を返します。
+- 結果はキャッシュされ、ファイル内容が変わらなければ再実行時にキャッシュ ヒットします。
+
 ## 偽陽性の抑制 (suppressions)
 
 プロジェクトの `.complete-validator/suppressions.md` に記述すると、該当する検出が抑制されます。

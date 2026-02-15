@@ -19,7 +19,7 @@ git commit 時の自動チェック (PreToolUse hook) と、任意のタイミ�
 ### GitHub からインストール
 
 ```bash
-/plugin marketplace add <owner>/complete-validator
+/plugin marketplace add inoueakimitsu/complete-validator
 /plugin install complete-validator@complete-validator --scope project
 ```
 
