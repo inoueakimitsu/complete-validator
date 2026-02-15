@@ -29,7 +29,7 @@ case "$COMMAND" in
     git\ commit*)
         # Delegate to Python script, capturing stderr to log file
         # Always exit 0 to prevent Claude Code from treating hook as error
-        python3 "$PLUGIN_DIR/scripts/check_style.py" --staged --project-dir "$PLUGIN_DIR" 2>>"$LOG_FILE"
+        python3 "$PLUGIN_DIR/scripts/check_style.py" --staged --plugin-dir "$PLUGIN_DIR" 2>>"$LOG_FILE"
         EXIT_CODE=$?
         if [ $EXIT_CODE -ne 0 ]; then
             echo "{\"ts\": \"$(date -Iseconds)\", \"exit_code\": $EXIT_CODE}" >> "$LOG_FILE"

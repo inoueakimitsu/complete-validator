@@ -31,8 +31,8 @@ python3 scripts/check_style.py
 # staged な変更をチェック
 python3 scripts/check_style.py --staged
 
-# ルールディレクトリを明示指定
-python3 scripts/check_style.py --project-dir /path/to/complete-validator
+# プラグインディレクトリを明示指定 (組み込みルールの場所)
+python3 scripts/check_style.py --plugin-dir /path/to/complete-validator
 ```
 
 ## 偽陽性の抑制 (suppressions)
@@ -49,4 +49,12 @@ python3 scripts/check_style.py --project-dir /path/to/complete-validator
 
 ## ルールの追加
 
-`rules/` ディレクトリに `.md` ファイルを追加してください。`## ` 見出しでルールを区切り、Bad/Good の具体例を記載します。
+### プラグイン組み込みルール
+
+プラグインの `rules/` ディレクトリに `.md` ファイルを追加してください。全プロジェクトに適用されます。
+
+### プロジェクト固有ルール
+
+プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加してください。そのプロジェクトのみに適用されます。組み込みルールと同名のファイルを置くと、プロジェクト側が優先されます (nearest wins)。
+
+いずれの場合も `## ` 見出しでルールを区切り、Bad/Good の具体例を記載します。

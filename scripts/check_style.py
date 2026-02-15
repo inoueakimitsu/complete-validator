@@ -34,14 +34,6 @@ def run_git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def detect_project_dir() -> Path:
-    """Detect the project directory using git rev-parse --show-toplevel."""
-    toplevel = run_git("rev-parse", "--show-toplevel")
-    if not toplevel:
-        return Path.cwd()
-    return Path(toplevel)
-
-
 def get_diff(staged: bool) -> str:
     """Get the diff (staged or working)."""
     if staged:
@@ -96,8 +88,8 @@ def parse_frontmatter(content: str) -> tuple[dict | None, str]:
     return frontmatter, body
 
 
-def load_rules_with_targets(project_dir: Path) -> tuple[list[tuple[str, list[str], str]], list[str]]:
-    """Load rule files with their target patterns from frontmatter.
+def load_rules_from_dir(rules_dir: Path) -> tuple[list[tuple[str, list[str], str]], list[str]]:
+    """Load rule files with their target patterns from a single directory.
 
     Returns
     -------
@@ -105,7 +97,6 @@ def load_rules_with_targets(project_dir: Path) -> tuple[list[tuple[str, list[str
         (rules, warnings) where rules is a list of (filename, patterns, body)
         and warnings is a list of warning messages for files without frontmatter.
     """
-    rules_dir = project_dir / "rules"
     if not rules_dir.exists():
         return [], []
 
@@ -130,6 +121,53 @@ def load_rules_with_targets(project_dir: Path) -> tuple[list[tuple[str, list[str
     return rules, warnings
 
 
+def find_project_rules_dirs() -> list[Path]:
+    """CWD から上方向に .complete-validator/rules/ を探索します。
+
+    見つかった全ディレクトリを近い順 (CWD 側が先) に返します。
+    """
+    dirs = []
+    current = Path.cwd().resolve()
+    while True:
+        candidate = current / ".complete-validator" / "rules"
+        if candidate.is_dir():
+            dirs.append(candidate)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return dirs
+
+
+def merge_rules(
+    builtin_dir: Path | None,
+    project_dirs: list[Path],
+) -> tuple[list[tuple[str, list[str], str]], list[str]]:
+    """組み込みルールとプロジェクト ルールをマージします。
+
+    優先順位:
+    1. CWD に最も近い .complete-validator/rules/ が最優先
+    2. 親ディレクトリの .complete-validator/rules/ が次に優先
+    3. プラグイン組み込み rules/ がベース (最低優先)
+
+    同名ファイルは近い方が勝ちます (nearest wins)。
+    """
+    all_warnings: list[str] = []
+    # Collect rule sources: nearest first, builtin last
+    sources: list[Path] = list(project_dirs)
+    if builtin_dir is not None:
+        sources.append(builtin_dir)
+
+    merged: dict[str, tuple[str, list[str], str]] = {}
+    for rules_dir in reversed(sources):
+        rules, warnings = load_rules_from_dir(rules_dir)
+        all_warnings.extend(warnings)
+        for name, patterns, body in rules:
+            merged[name] = (name, patterns, body)
+
+    return list(merged.values()), all_warnings
+
+
 def match_files_to_rules(
     rules: list[tuple[str, list[str], str]],
     changed_files: list[str],
@@ -148,15 +186,20 @@ def match_files_to_rules(
     return file_rules
 
 
-def load_suppressions(project_dir: Path) -> str:
-    """Load suppressions from .complete-validator/suppressions.md in the git toplevel.
+def load_suppressions(base_dir: Path) -> str:
+    """Load suppressions from .complete-validator/suppressions.md.
 
-    Returns the file content, or empty string if the file doesn't exist.
+    Parameters
+    ----------
+    base_dir : Path
+        .complete-validator/suppressions.md を探すディレクトリです (通常は git toplevel)。
+
+    Returns
+    -------
+    str
+        ファイルの内容を返します。ファイルが存在しない場合は空文字列を返します。
     """
-    git_toplevel = run_git("rev-parse", "--show-toplevel")
-    if not git_toplevel:
-        return ""
-    suppressions_path = Path(git_toplevel) / ".complete-validator" / "suppressions.md"
+    suppressions_path = base_dir / ".complete-validator" / "suppressions.md"
     if not suppressions_path.exists():
         return ""
     try:
@@ -355,10 +398,10 @@ def parse_args() -> argparse.Namespace:
         help="Check staged changes (for commit hooks). Default: check working changes.",
     )
     parser.add_argument(
-        "--project-dir",
+        "--plugin-dir",
         type=Path,
         default=None,
-        help="Base directory for rules/ and cache. Default: auto-detect via git rev-parse --show-toplevel.",
+        help="Plugin directory containing built-in rules/.",
     )
     return parser.parse_args()
 
@@ -366,8 +409,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     staged = args.staged
-    project_dir = args.project_dir if args.project_dir else detect_project_dir()
-    cache_path = project_dir / ".complete-validator" / "cache.json"
+    plugin_dir = args.plugin_dir
+
+    # Cache is stored at git toplevel
+    git_toplevel = run_git("rev-parse", "--show-toplevel")
+    cache_dir = Path(git_toplevel) if git_toplevel else Path.cwd()
+    cache_path = cache_dir / ".complete-validator" / "cache.json"
 
     # Get diff
     diff = get_diff(staged)
@@ -379,8 +426,10 @@ def main() -> None:
     if not changed_files:
         sys.exit(0)
 
-    # Load rules with frontmatter
-    rules, warnings = load_rules_with_targets(project_dir)
+    # Load rules: parent directory search + built-in
+    project_dirs = find_project_rules_dirs()
+    builtin_dir = plugin_dir / "rules" if plugin_dir else None
+    rules, warnings = merge_rules(builtin_dir, project_dirs)
 
     # Output warnings for rule files without frontmatter
     if warnings and not rules:
@@ -398,8 +447,8 @@ def main() -> None:
             output_result("allow", "[Validator]\n" + "\n".join(warnings))
         sys.exit(0)
 
-    # Load suppressions
-    suppressions = load_suppressions(project_dir)
+    # Load suppressions (always from git toplevel)
+    suppressions = load_suppressions(cache_dir)
 
     # Compute all rules content for cache key
     all_rules_content = "\n\n---\n\n".join(body for _, _, body in rules)

@@ -48,13 +48,13 @@ hooks/hooks.json (PreToolUse: Bash)
 scripts/check_style.sh
   │  - tool_input.command が "git commit" で始まるか判定
   │  - git commit 以外 → exit 0 (出力なし = 許可、数十ms)
-  │  - git commit → check_style.py --staged --project-dir に委譲
+  │  - git commit → check_style.py --staged --plugin-dir に委譲
   │
   ▼
-scripts/check_style.py --staged --project-dir "$PLUGIN_DIR"
+scripts/check_style.py --staged --plugin-dir "$PLUGIN_DIR"
   │  1. git diff --cached で staged diff 取得
   │  2. git diff --cached --name-only --diff-filter=d で全 staged ファイル取得
-  │  3. rules/*.md をフロントマター付きで読み込み、ファイルとルールをマッチング
+  │  3. CWD から上方向に .complete-validator/rules/ を探索し、プラグイン組み込み rules/ とマージ
   │  4. .complete-validator/suppressions.md を読み込み (存在すれば)
   │  5. cache key = sha256(prompt_version + diff + rules + suppressions) → キャッシュヒットなら即返却
   │  6. git show :<path> で staged 版ファイル内容取得
@@ -128,14 +128,14 @@ Plugin のメタデータを定義します。`name` がプラグイン名とし
 ```bash
 python3 scripts/check_style.py                    # working モード (デフォルト)
 python3 scripts/check_style.py --staged            # staged モード
-python3 scripts/check_style.py --project-dir DIR   # ルール/キャッシュのベースディレクトリを指定
+python3 scripts/check_style.py --plugin-dir DIR    # プラグインディレクトリを指定 (組み込みルールの場所)
 ```
 
 **処理フロー:**
 
 1. **diff 取得** — working: `git diff` / staged: `git diff --cached`。空なら exit 0 (許可)
 2. **変更ファイル一覧取得** — `git diff --name-only --diff-filter=d` (staged 時は `--cached` 付き)
-3. **ルール読み込み** — `rules/` 内の全 `.md` ファイルをフロントマター付きで読み込み、`applies_to` パターンで対象ファイルをマッチング
+3. **ルール読み込み** — CWD から上方向に `.complete-validator/rules/` を探索し、プラグイン組み込み `rules/` とマージ (nearest wins)。`applies_to` パターンで対象ファイルをマッチング
 4. **suppressions 読み込み** — プロジェクトの `.complete-validator/suppressions.md` を読み込み (存在すれば)
 5. **キャッシュ確認** — `sha256(prompt_version + diff + rules + suppressions)` をキーに `.complete-validator/cache.json` を参照
 6. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
@@ -144,8 +144,6 @@ python3 scripts/check_style.py --project-dir DIR   # ルール/キャッシュ�
 9. **結果出力** — 違反あり → `"permissionDecision": "deny"` / 違反なし → `"allow"` として stdout に出力
 10. **キャッシュ保存** — 結果を cache.json に書き込み
 
-**`--project-dir` の自動検出:** 省略時は `git rev-parse --show-toplevel` で検出します。
-
 設計上の重要な判断です。
 
 - **違反あり → `"permissionDecision": "deny"`** — commit をブロックします。エージェントが違反を修正してから再 commit します
@@ -153,11 +151,51 @@ python3 scripts/check_style.py --project-dir DIR   # ルール/キャッシュ�
 - **エラー時は allow** — `claude -p` のタイムアウト (90 秒) や失敗時は警告メッセージ付きで allow します
 - **キャッシュ** — 同じ diff + ルール + suppressions の組み合わせなら `claude -p` を呼ばず即座にキャッシュ返却します
 
+## ルールの読み込み順序
+
+ルールは以下の順序で読み込まれ、同名ファイルは近い方が勝ちます (nearest wins)。
+
+1. **CWD に最も近い `.complete-validator/rules/`** — 最優先
+2. **親ディレクトリの `.complete-validator/rules/`** — 上位に向かって順に探索
+3. **プラグイン組み込み `rules/`** — ベース (最低優先)
+
+異なるファイル名のルールはすべてマージされます。同名ファイルは近い方が完全に置き換えます (部分マージなし)。
+
+**典型的なプロジェクト:**
+
+```
+/project/.complete-validator/rules/    ← 1番目 (プロジェクト固有)
+$PLUGIN_DIR/rules/                     ← 2番目 (組み込み)
+```
+
+**モノレポ:**
+
+```
+/repo/.complete-validator/rules/              ← 3番目 (リポジトリ共通)
+/repo/packages/api/.complete-validator/rules/ ← 2番目 (パッケージ固有)
+/repo/packages/api/src/                       ← CWD
+$PLUGIN_DIR/rules/                            ← 4番目 (組み込み)
+```
+
 ## ルールの追加方法
 
-`rules/` ディレクトリに `.md` ファイルを追加します。ファイルはアルファベット順に読み込まれます。
+### プラグイン組み込みルール
 
-ルールファイルのフォーマットです。
+`rules/` ディレクトリに `.md` ファイルを追加します。ファイルはアルファベット順に読み込まれます。全プロジェクトに適用されます。
+
+### プロジェクト固有ルール
+
+プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加します。そのプロジェクトのみに適用されます。組み込みルールと同名のファイルを置くと、プロジェクト側が優先されます。
+
+```bash
+# プロジェクト固有ルールのディレクトリを作成
+mkdir -p .complete-validator/rules
+
+# プロジェクト固有のルールを追加
+# (プラグイン組み込みルールと同じフォーマット)
+```
+
+### ルールファイルのフォーマット
 
 - 先頭に YAML フロントマターで `applies_to` を指定します (必須)
 - `applies_to` にはファイル名の glob パターンのリストを指定します
@@ -188,8 +226,8 @@ applies_to: ["*.py", "*.md"]
 
 ## キャッシュ
 
-- 保存場所は `.complete-validator/cache.json` です
-- キーは `sha256(prompt_version + ルール全文 + diff + suppressions)` です
+- 保存場所は `$GIT_TOPLEVEL/.complete-validator/cache.json` です (git toplevel に配置)
+- キーは `sha256(prompt_version + マージ後ルール全文 + diff + suppressions)` です
 - diff、ルール、または suppressions が変わると自動的にキャッシュミスになります
 - キャッシュクリアは `rm -f .complete-validator/cache.json` です
 - `.gitignore` により Git 管理外です
@@ -227,7 +265,7 @@ applies_to: ["*.py", "*.md"]
 # git commit 以外のコマンド → 即 exit 0 (出力なし)
 echo '{"tool_input":{"command":"git status"}}' | bash scripts/check_style.sh
 
-# git commit → AI バリデーション実行 (--staged --project-dir で委譲)
+# git commit → AI バリデーション実行 (--staged --plugin-dir で委譲)
 echo '{"tool_input":{"command":"git commit -m test"}}' | bash scripts/check_style.sh
 ```
 
@@ -240,8 +278,8 @@ python3 scripts/check_style.py
 # staged な変更をチェック
 python3 scripts/check_style.py --staged
 
-# project-dir を明示指定
-python3 scripts/check_style.py --project-dir /path/to/complete-validator
+# plugin-dir を明示指定 (組み込みルールの場所)
+python3 scripts/check_style.py --plugin-dir /path/to/complete-validator
 ```
 
 ### キャッシュクリア
