@@ -1,7 +1,8 @@
 # CompleteValidator
 
-git commit 時に `rules/` 内の Markdown ルールに基づく AI スタイルチェックを自動実行する Claude Code Plugin です。
-PreToolUse hook から `claude -p` を呼び出し、検出した違反を systemMessage として Claude Code エージェントに返します。
+`rules/` 内の Markdown ルールに基づく AI スタイルチェックを実行する Claude Code Plugin です。
+git commit 時の自動チェック (PreToolUse hook) と、任意のタイミングでのオンデマンドチェックの 2 つのモードをサポートします。
+検出した違反は systemMessage として Claude Code エージェントに返します。
 
 ## インストール
 
@@ -47,10 +48,10 @@ hooks/hooks.json (PreToolUse: Bash)
 scripts/check_style.sh
   │  - tool_input.command が "git commit" で始まるか判定
   │  - git commit 以外 → exit 0 (出力なし = 許可、数十ms)
-  │  - git commit → check_style.py に委譲
+  │  - git commit → check_style.py --staged --project-dir に委譲
   │
   ▼
-scripts/check_style.py
+scripts/check_style.py --staged --project-dir "$PLUGIN_DIR"
   │  1. git diff --cached で staged diff 取得
   │  2. git diff --cached --name-only --diff-filter=d で全 staged ファイル取得
   │  3. rules/*.md をフロントマター付きで読み込み、ファイルとルールをマッチング
@@ -116,17 +117,31 @@ Plugin のメタデータを定義します。`name` がプラグイン名とし
 
 ### `scripts/check_style.py`
 
-主要な処理フローです。
+主要な処理フローです。2 つのモードをサポートします。
 
-1. **staged diff 取得** — 空なら何も出力せず exit 0 (許可)
-2. **staged ファイル一覧取得** — 全 staged ファイル (削除除く) を取得
+- **working モード** (デフォルト) — `git diff` で unstaged な変更をチェック。オンデマンド実行用
+- **staged モード** (`--staged`) — `git diff --cached` で staged な変更をチェック。commit hook 用
+
+**CLI:**
+```bash
+python3 scripts/check_style.py                    # working モード (デフォルト)
+python3 scripts/check_style.py --staged            # staged モード
+python3 scripts/check_style.py --project-dir DIR   # ルール/キャッシュのベースディレクトリを指定
+```
+
+**処理フロー:**
+
+1. **diff 取得** — working: `git diff` / staged: `git diff --cached`。空なら exit 0 (許可)
+2. **変更ファイル一覧取得** — `git diff --name-only --diff-filter=d` (staged 時は `--cached` 付き)
 3. **ルール読み込み** — `rules/` 内の全 `.md` ファイルをフロントマター付きで読み込み、`applies_to` パターンで対象ファイルをマッチング
 4. **キャッシュ確認** — `sha256(diff + rules)` をキーに `.complete-validator/cache.json` を参照
-5. **ファイル内容取得** — `git show :<path>` でマッチしたファイルの staged 版を取得
+5. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
 6. **プロンプト構築** — ルールとファイルの対応関係を明示したプロンプトを構築
 7. **`claude -p` 実行** — `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
 8. **結果出力** — `{"decision":"allow","systemMessage":"[Style Check Result]\n..."}` を stdout に出力
 9. **キャッシュ保存** — 結果を cache.json に書き込み
+
+**`--project-dir` の自動検出:** 省略時は `git rev-parse --show-toplevel` で検出します。
 
 設計上の重要な判断です。
 
@@ -170,7 +185,7 @@ applies_to: ["*.py", "*.md"]
 ## キャッシュ
 
 - 保存場所は `.complete-validator/cache.json` です
-- キーは `sha256(staged diff + ルール全文)` です
+- キーは `sha256(diff + ルール全文)` です
 - diff またはルールが変わると自動的にキャッシュミスになります
 - キャッシュクリアは `rm -f .complete-validator/cache.json` です
 - `.gitignore` により Git 管理外です
@@ -183,14 +198,32 @@ applies_to: ["*.py", "*.md"]
 
 ## 手動テスト
 
+### commit hook 経由 (staged モード)
+
 ```bash
 # git commit 以外のコマンド → 即 exit 0 (出力なし)
 echo '{"tool_input":{"command":"git status"}}' | bash scripts/check_style.sh
 
-# git commit → スタイルチェック実行
+# git commit → スタイルチェック実行 (--staged --project-dir で委譲)
 echo '{"tool_input":{"command":"git commit -m test"}}' | bash scripts/check_style.sh
+```
 
-# キャッシュクリア
+### オンデマンド (working モード)
+
+```bash
+# unstaged な変更をチェック (デフォルト)
+python3 scripts/check_style.py
+
+# staged な変更をチェック
+python3 scripts/check_style.py --staged
+
+# project-dir を明示指定
+python3 scripts/check_style.py --project-dir /path/to/complete-validator
+```
+
+### キャッシュクリア
+
+```bash
 rm -f .complete-validator/cache.json
 ```
 

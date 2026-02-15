@@ -5,13 +5,28 @@ description: git commit 時にルールベースの AI スタイルチェック�
 
 # CompleteValidator
 
-git commit 時に `rules/` 内の Markdown ルールに基づく AI スタイルチェックを自動実行するプラグインです。
+`rules/` 内の Markdown ルールに基づく AI スタイルチェックを実行するプラグインです。
 
-## 仕組み
+## 自動チェック (commit hook)
 
 PreToolUse hook により、Bash ツールで `git commit` が実行される際に自動で発火します。
-staged された Python ファイルに対してルールチェックを行い、違反があれば systemMessage でエージェントに通知します。
+staged された変更に対してルールチェックを行い、違反があれば systemMessage でエージェントに通知します。
 commit はブロックせず、エージェントが違反を修正してから再度 commit します。
+
+## オンデマンドチェック
+
+commit 前に任意のタイミングでスタイルチェックを実行できます。
+
+```bash
+# working (unstaged) な変更をチェック（デフォルト）
+python3 scripts/check_style.py
+
+# staged な変更をチェック
+python3 scripts/check_style.py --staged
+
+# ルールディレクトリを明示指定
+python3 scripts/check_style.py --project-dir /path/to/complete-validator
+```
 
 ## ルールの追加
 

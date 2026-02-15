@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Style checker for git commits using Claude AI.
+"""Style checker using Claude AI.
 
-Reads staged diff, checks against rules defined in rules/*.md,
-and returns results as a PreToolUse hook response.
+Checks files against rules defined in rules/*.md.
+Supports two modes:
+  - working (default): checks unstaged changes (for on-demand use)
+  - staged (--staged):  checks staged changes (for commit hooks)
+
 Always allows the commit — violations are reported via systemMessage
 so the Claude Code agent can fix them.
 """
 
+import argparse
 import hashlib
 import json
 import os
@@ -27,22 +31,35 @@ def run_git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def get_staged_diff() -> str:
-    """Get the full staged diff."""
-    return run_git("diff", "--cached")
+def detect_project_dir() -> Path:
+    """Detect the project directory using git rev-parse --show-toplevel."""
+    toplevel = run_git("rev-parse", "--show-toplevel")
+    if not toplevel:
+        return Path.cwd()
+    return Path(toplevel)
 
 
-def get_staged_files() -> list[str]:
-    """Get list of all staged files (excluding deleted)."""
-    output = run_git("diff", "--cached", "--name-only", "--diff-filter=d")
-    if not output:
-        return []
-    return output.splitlines()
+def get_diff(staged: bool) -> str:
+    """Get the diff (staged or working)."""
+    if staged:
+        return run_git("diff", "--cached")
+    return run_git("diff")
 
 
-def get_staged_file_content(path: str) -> str:
-    """Get the staged version of a file."""
-    return run_git("show", f":{path}")
+def get_changed_files(staged: bool) -> list[str]:
+    """Get list of changed files (excluding deleted)."""
+    args = ["diff", "--name-only", "--diff-filter=d"]
+    if staged:
+        args.insert(1, "--cached")
+    output = run_git(*args)
+    return output.splitlines() if output else []
+
+
+def get_file_content(path: str, staged: bool) -> str:
+    """Get file content (staged version or working copy)."""
+    if staged:
+        return run_git("show", f":{path}")
+    return Path(path).read_text(encoding="utf-8")
 
 
 def parse_frontmatter(content: str) -> tuple[dict | None, str]:
@@ -112,15 +129,15 @@ def load_rules_with_targets(project_dir: Path) -> tuple[list[tuple[str, list[str
 
 def match_files_to_rules(
     rules: list[tuple[str, list[str], str]],
-    staged_files: list[str],
+    changed_files: list[str],
 ) -> dict[str, list[tuple[str, str]]]:
-    """Match staged files to applicable rules.
+    """Match changed files to applicable rules.
 
     Returns a dict mapping each file path to a list of (rule_name, rule_body).
     Only files that match at least one rule are included.
     """
     file_rules: dict[str, list[tuple[str, str]]] = {}
-    for file_path in staged_files:
+    for file_path in changed_files:
         filename = os.path.basename(file_path)
         for rule_name, patterns, body in rules:
             if any(fnmatch(filename, pat) for pat in patterns):
@@ -206,7 +223,7 @@ def build_prompt(
             parts.append("")
         parts.append("")
 
-    parts.append("=== STAGED FILES ===")
+    parts.append("=== CHANGED FILES ===")
     for path, content in files.items():
         parts.append(f"--- {path} ---")
         parts.append(content)
@@ -226,18 +243,39 @@ def output_result(decision: str, message: str = "") -> None:
     print(json.dumps(result))
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Style checker using Claude AI."
+    )
+    parser.add_argument(
+        "--staged",
+        action="store_true",
+        help="Check staged changes (for commit hooks). Default: check working changes.",
+    )
+    parser.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        help="Base directory for rules/ and cache. Default: auto-detect via git rev-parse --show-toplevel.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    project_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
+    args = parse_args()
+    staged = args.staged
+    project_dir = args.project_dir if args.project_dir else detect_project_dir()
     cache_path = project_dir / ".complete-validator" / "cache.json"
 
-    # Get staged diff
-    diff = get_staged_diff()
+    # Get diff
+    diff = get_diff(staged)
     if not diff:
         sys.exit(0)
 
-    # Get all staged files
-    staged_files = get_staged_files()
-    if not staged_files:
+    # Get changed files
+    changed_files = get_changed_files(staged)
+    if not changed_files:
         sys.exit(0)
 
     # Load rules with frontmatter
@@ -252,9 +290,9 @@ def main() -> None:
         sys.exit(0)
 
     # Match files to rules
-    file_rules = match_files_to_rules(rules, staged_files)
+    file_rules = match_files_to_rules(rules, changed_files)
     if not file_rules:
-        # No staged files match any rule patterns
+        # No changed files match any rule patterns
         if warnings:
             output_result("allow", "[Style Check]\n" + "\n".join(warnings))
         sys.exit(0)
@@ -270,10 +308,13 @@ def main() -> None:
             output_result("allow", cached_message)
         sys.exit(0)
 
-    # Get staged file contents for matched files
+    # Get file contents for matched files
     files: dict[str, str] = {}
     for file_path in file_rules:
-        content = get_staged_file_content(file_path)
+        try:
+            content = get_file_content(file_path, staged)
+        except (OSError, UnicodeDecodeError):
+            continue
         if content:
             files[file_path] = content
 

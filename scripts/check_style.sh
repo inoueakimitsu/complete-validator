@@ -27,7 +27,7 @@ print(data.get('tool_input', {}).get('command', ''))
 case "$COMMAND" in
     git\ commit*)
         # Delegate to Python script
-        exec python3 "$PLUGIN_DIR/scripts/check_style.py" "$PLUGIN_DIR"
+        exec python3 "$PLUGIN_DIR/scripts/check_style.py" --staged --project-dir "$PLUGIN_DIR"
         ;;
     *)
         # Not a git commit — allow immediately (no output = allow)
