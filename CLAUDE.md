@@ -56,12 +56,14 @@ scripts/check_style.py --staged --plugin-dir "$PLUGIN_DIR"
   │  2. git diff --cached --name-only --diff-filter=d で全 staged ファイル取得
   │  3. CWD から上方向に .complete-validator/rules/ を探索し、プラグイン組み込み rules/ とマージ
   │  4. .complete-validator/suppressions.md を読み込み (存在すれば)
-  │  5. cache key = sha256(prompt_version + diff + rules + suppressions) → キャッシュヒットなら即返却
-  │  6. git show :<path> で staged 版ファイル内容取得
-  │  7. プロンプト構築 (ファイルごとにルール・diff・全文をインターリーブ配置 + suppressions)
-  │  8. claude -p でチェック実行 (CLAUDECODE 環境変数を除去してネスト検出回避)
-  │  9. 違反あり → deny / 違反なし → allow として stdout に出力
-  │  10. キャッシュ保存
+  │  5. git show :<path> で staged 版ファイル内容取得
+  │  6. ルールファイルごとに並列チェック:
+  │     a. cache key = sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)
+  │     b. キャッシュヒット → 即返却 (部分キャッシュ)
+  │     c. プロンプト構築 (1 ルールファイル + 該当ファイルの diff/全文 + suppressions)
+  │     d. claude -p でチェック実行 (CLAUDECODE 環境変数を除去してネスト検出回避)
+  │     e. キャッシュ保存
+  │  7. 全ルールの結果を集約 → deny が 1 つでもあれば全体 deny
   │
   ▼
 Claude Code エージェント
@@ -137,19 +139,23 @@ python3 scripts/check_style.py --plugin-dir DIR    # プラグインディレク
 2. **変更ファイル一覧取得** — `git diff --name-only --diff-filter=d` (staged 時は `--cached` 付き)
 3. **ルール読み込み** — CWD から上方向に `.complete-validator/rules/` を探索し、プラグイン組み込み `rules/` とマージ (nearest wins)。`applies_to` パターンで対象ファイルをマッチング
 4. **suppressions 読み込み** — プロジェクトの `.complete-validator/suppressions.md` を読み込み (存在すれば)
-5. **キャッシュ確認** — `sha256(prompt_version + diff + rules + suppressions)` をキーに `.complete-validator/cache.json` を参照
-6. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
-7. **プロンプト構築** — ファイルごとにルール・diff・全文をインターリーブ配置したプロンプトを構築 (チェックリスト + suppressions + リマインダー付き)
-8. **`claude -p` 実行** — `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
-9. **結果出力** — 違反あり → `"permissionDecision": "deny"` / 違反なし → `"allow"` として stdout に出力
-10. **キャッシュ保存** — 結果を cache.json に書き込み
+5. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
+6. **ルールファイルごとに並列チェック** — `ThreadPoolExecutor` でルールファイル単位に `claude -p` を並列実行:
+   a. **キャッシュ確認** — `sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)` をキーに部分キャッシュを参照
+   b. **プロンプト構築** — 1 ルールファイル + 該当ファイルの diff/全文 + suppressions
+   c. **`claude -p` 実行** — `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
+   d. **キャッシュ保存** — ルール単位でキャッシュ
+7. **結果集約** — 全ルールの結果をルールファイル名でソートして集約。deny が 1 つでもあれば全体 deny
 
 設計上の重要な判断です。
 
+- **ルールファイル単位の分割実行** — 各 `claude -p` のプロンプトが小さくなり、検出精度が向上します
+- **並列実行** — ルールファイル数分のワーカーで並列実行し、全体の実行時間を短縮します
+- **部分キャッシュ** — ルールファイル単位でキャッシュするため、1 つのルールだけ変更した場合でも他はキャッシュヒットします
 - **違反あり → `"permissionDecision": "deny"`** — commit をブロックします。エージェントが違反を修正してから再 commit します
 - **偽陽性対策** — `.complete-validator/suppressions.md` に記述することで、既知の偽陽性を抑制できます
 - **エラー時は allow** — `claude -p` のタイムアウト (90 秒) や失敗時は警告メッセージ付きで allow します
-- **キャッシュ** — 同じ diff + ルール + suppressions の組み合わせなら `claude -p` を呼ばず即座にキャッシュ返却します
+- **deadline 管理** — hook の 120 秒タイムアウトの手前 (110 秒) を deadline とし、各 Future の取得時に残り時間を計算します
 
 ## ルールの読み込み順序
 
@@ -227,8 +233,9 @@ applies_to: ["*.py", "*.md"]
 ## キャッシュ
 
 - 保存場所は `$GIT_TOPLEVEL/.complete-validator/cache.json` です (git toplevel に配置)
-- キーは `sha256(prompt_version + マージ後ルール全文 + diff + suppressions)` です
+- キーは `sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)` です (ルールファイル単位)
 - diff、ルール、または suppressions が変わると自動的にキャッシュミスになります
+- 1 つのルールだけ変更した場合、他のルールはキャッシュヒットして高速化します (部分キャッシュ)
 - キャッシュクリアは `rm -f .complete-validator/cache.json` です
 - `.gitignore` により Git 管理外です
 

@@ -6,6 +6,7 @@ Supports two modes:
   - working (default): validates unstaged changes (for on-demand use)
   - staged (--staged):  validates staged changes (for commit hooks)
 
+Runs claude -p per rule file in parallel for better detection accuracy.
 Violations are denied (commit blocked) so the agent must fix them.
 False positives can be suppressed via .complete-validator/suppressions.md.
 """
@@ -17,11 +18,14 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fnmatch import fnmatch
 from pathlib import Path
 
 
-PROMPT_VERSION = "2"
+PROMPT_VERSION = "3"
 
 
 def run_git(*args: str) -> str:
@@ -186,6 +190,20 @@ def match_files_to_rules(
     return file_rules
 
 
+def files_for_rule(
+    rule_name: str,
+    rule_patterns: list[str],
+    changed_files: list[str],
+) -> list[str]:
+    """Return changed files that match a rule's applies_to patterns."""
+    matched = []
+    for file_path in changed_files:
+        filename = os.path.basename(file_path)
+        if any(fnmatch(filename, pat) for pat in rule_patterns):
+            matched.append(file_path)
+    return matched
+
+
 def load_suppressions(base_dir: Path) -> str:
     """Load suppressions from .complete-validator/suppressions.md.
 
@@ -208,9 +226,15 @@ def load_suppressions(base_dir: Path) -> str:
         return ""
 
 
-def compute_cache_key(diff: str, rules_content: str, suppressions: str = "") -> str:
-    """Compute SHA256 hash of prompt version + diff + rules + suppressions for caching."""
-    content = PROMPT_VERSION + "\n---RULES---\n" + rules_content + "\n---DIFF---\n" + diff + "\n---SUPPRESSIONS---\n" + suppressions
+def compute_cache_key(rule_name: str, rule_body: str, diff_for_rule: str, suppressions: str = "") -> str:
+    """Compute SHA256 hash for per-rule caching."""
+    content = (
+        PROMPT_VERSION
+        + "\n---RULE_NAME---\n" + rule_name
+        + "\n---RULE_BODY---\n" + rule_body
+        + "\n---DIFF---\n" + diff_for_rule
+        + "\n---SUPPRESSIONS---\n" + suppressions
+    )
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
@@ -278,36 +302,32 @@ def split_diff_by_file(diff: str) -> dict[str, str]:
 
 
 def extract_rule_headings(rule_body: str) -> list[str]:
-    """Extract ## headings from a rule body for the checklist."""
+    """Extract ## headings from a rule body for the checklist.
+
+    Skips headings inside fenced code blocks (``` or ~~~).
+    """
     headings = []
+    in_code_block = False
     for line in rule_body.splitlines():
-        if line.startswith("## "):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and line.startswith("## "):
             headings.append(line[3:].strip())
     return headings
 
 
-def build_prompt(
-    file_rules: dict[str, list[tuple[str, str]]],
+def build_prompt_for_rule(
+    rule_name: str,
+    rule_body: str,
+    matched_files: list[str],
     files: dict[str, str],
-    diff: str,
+    diff_chunks: dict[str, str],
     suppressions: str = "",
 ) -> str:
-    """Build the prompt for Claude rule checking.
-
-    Uses a per-file interleaved structure:
-      System instructions -> Rules Checklist -> per-file (rules, diff, full content) -> Suppressions -> Reminder
-    """
-    # Collect all unique rule headings for the checklist
-    all_headings: list[str] = []
-    seen_rules: set[str] = set()
-    for rule_list in file_rules.values():
-        for rule_name, rule_body in rule_list:
-            if rule_name not in seen_rules:
-                seen_rules.add(rule_name)
-                all_headings.extend(extract_rule_headings(rule_body))
-
-    # Split diff into per-file chunks
-    diff_chunks = split_diff_by_file(diff)
+    """Build the prompt for checking a single rule file against its matched files."""
+    headings = extract_rule_headings(rule_body)
 
     parts = [
         "You are a strict AI validator. You MUST check every rule listed for each file. Do not skip any rule.",
@@ -316,32 +336,28 @@ def build_prompt(
         "Be specific: state the file, line, and which rule is violated.",
         "If there are no violations, respond with exactly: 'No violations found.'",
         "",
-        "If the Task tool is available, you may use subagents to parallelize the validation work.",
-        "",
     ]
 
     # Rules Checklist
-    if all_headings:
+    if headings:
         parts.append("## Rules Checklist")
         parts.append("You must check each of the following rules for every applicable file:")
-        for heading in all_headings:
+        for heading in headings:
             parts.append(f"- [ ] {heading}")
         parts.append("")
 
-    # Per-file interleaved sections
-    for file_path, rule_list in file_rules.items():
+    # Rule content
+    parts.append(f"=== RULE: {rule_name} ===")
+    parts.append(rule_body)
+    parts.append("")
+
+    # Per-file sections
+    for file_path in matched_files:
         if file_path not in files:
             continue
 
         parts.append(f"=== FILE: {file_path} ===")
         parts.append("")
-
-        # Applicable rules for this file
-        parts.append("--- Applicable Rules ---")
-        for rule_name, rule_body in rule_list:
-            parts.append(f"[{rule_name}]")
-            parts.append(rule_body)
-            parts.append("")
 
         # Diff for this file (primary check target)
         parts.append("--- Changes (primary check target) ---")
@@ -370,6 +386,65 @@ def build_prompt(
     parts.append("Do not skip any rule. Report all violations found.")
 
     return "\n".join(parts)
+
+
+def check_single_rule(
+    rule_name: str,
+    rule_body: str,
+    rule_patterns: list[str],
+    changed_files: list[str],
+    files: dict[str, str],
+    diff_chunks: dict[str, str],
+    suppressions: str,
+    cache: dict,
+    cache_path: Path,
+    cache_lock: threading.Lock,
+) -> tuple[str, str, str]:
+    """Check a single rule file against its matched files.
+
+    Returns (rule_name, status, message) where status is "deny", "allow", or "error".
+    """
+    matched = files_for_rule(rule_name, rule_patterns, changed_files)
+    # Filter to files we actually have content for
+    matched = [f for f in matched if f in files]
+    if not matched:
+        return rule_name, "skip", ""
+
+    # Build diff for this rule's files only
+    diff_for_rule = "".join(diff_chunks.get(f, "") for f in matched)
+
+    # Cache check
+    cache_key = compute_cache_key(rule_name, rule_body, diff_for_rule, suppressions)
+    with cache_lock:
+        if cache_key in cache:
+            cached = cache[cache_key]
+            has_violations = "[action required]" in cached.lower()
+            return rule_name, "deny" if has_violations else "allow", cached
+
+    # Build prompt and run Claude
+    prompt = build_prompt_for_rule(
+        rule_name, rule_body, matched, files, diff_chunks, suppressions,
+    )
+
+    try:
+        response = run_claude_check(prompt)
+    except subprocess.TimeoutExpired:
+        return rule_name, "error", f"[{rule_name}] Timed out waiting for Claude response."
+    except Exception as e:
+        return rule_name, "error", f"[{rule_name}] Error: {e}"
+
+    # Determine result
+    has_violations = "no violations found" not in response.lower()
+    message = f"[Rule: {rule_name}]\n{response}"
+    if has_violations:
+        message += "\n\n[Action Required]\nFix the violations above and retry the commit.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and retry."
+
+    # Save to cache
+    with cache_lock:
+        cache[cache_key] = message
+        save_cache(cache_path, cache)
+
+    return rule_name, "deny" if has_violations else "allow", message
 
 
 def output_result(decision: str, message: str = "") -> None:
@@ -441,7 +516,7 @@ def main() -> None:
     if not rules:
         sys.exit(0)
 
-    # Match files to rules
+    # Match files to rules (used only for early exit check)
     file_rules = match_files_to_rules(rules, changed_files)
     if not file_rules:
         # No changed files match any rule patterns
@@ -452,17 +527,11 @@ def main() -> None:
     # Load suppressions (always from git toplevel)
     suppressions = load_suppressions(cache_dir)
 
-    # Compute all rules content for cache key
-    all_rules_content = "\n\n---\n\n".join(body for _, _, body in rules)
-    cache_key = compute_cache_key(diff, all_rules_content, suppressions)
+    # Load cache
     cache = load_cache(cache_path)
 
-    if cache_key in cache:
-        cached_message = cache[cache_key]
-        if cached_message:
-            cached_has_violations = "[action required]" in cached_message.lower()
-            output_result("deny" if cached_has_violations else "allow", cached_message)
-        sys.exit(0)
+    # Split diff into per-file chunks
+    diff_chunks = split_diff_by_file(diff)
 
     # Get file contents for matched files
     files: dict[str, str] = {}
@@ -477,29 +546,67 @@ def main() -> None:
     if not files:
         sys.exit(0)
 
-    # Build prompt and run Claude
-    prompt = build_prompt(file_rules, files, diff, suppressions)
+    # Run checks per rule file in parallel
+    deadline = time.monotonic() + 110  # hook timeout is 120s
+    results: list[tuple[str, str, str]] = []
+    cache_lock = threading.Lock()
 
-    try:
-        response = run_claude_check(prompt)
-    except subprocess.TimeoutExpired:
-        output_result("allow", "[Validator] Timed out waiting for Claude response.")
-        sys.exit(0)
-    except Exception as e:
-        output_result("allow", f"[Validator] Error: {e}")
-        sys.exit(0)
+    with ThreadPoolExecutor(max_workers=len(rules)) as executor:
+        futures = {}
+        for rule_name, rule_patterns, rule_body in rules:
+            future = executor.submit(
+                check_single_rule,
+                rule_name, rule_body, rule_patterns,
+                changed_files, files, diff_chunks,
+                suppressions, cache, cache_path, cache_lock,
+            )
+            futures[future] = rule_name
 
-    # Cache and output result
-    has_violations = "no violations found" not in response.lower()
-    message = f"[Validator Result]\n{response}"
+        for future in as_completed(futures):
+            remaining = deadline - time.monotonic()
+            timeout = max(10, remaining)
+            try:
+                result = future.result(timeout=timeout)
+                results.append(result)
+            except Exception as e:
+                rule_name = futures[future]
+                results.append((rule_name, "error", f"[{rule_name}] Error: {e}"))
+
+    # Sort results by rule name for stable output
+    results.sort(key=lambda r: r[0])
+
+    # Aggregate results
+    deny_messages = []
+    allow_messages = []
+    error_messages = []
+
+    for rule_name, status, message in results:
+        if status == "skip":
+            continue
+        elif status == "deny":
+            deny_messages.append(message)
+        elif status == "error":
+            error_messages.append(message)
+        else:
+            allow_messages.append(message)
+
+    # Build final output
+    all_messages = deny_messages + allow_messages
+    if error_messages:
+        all_messages.append("\n[Warning]\n" + "\n".join(error_messages))
     if warnings:
-        message += "\n\n[Warning]\n" + "\n".join(warnings)
-    if has_violations:
-        message += "\n\n[Action Required]\nFix the violations above and retry the commit.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and retry.\nRepeat until all violations are resolved."
-    output_result("deny" if has_violations else "allow", message)
+        all_messages.append("\n[Warning]\n" + "\n".join(warnings))
 
-    cache[cache_key] = message
-    save_cache(cache_path, cache)
+    if not all_messages:
+        sys.exit(0)
+
+    message = "[Validator Result]\n" + "\n\n".join(all_messages)
+
+    if deny_messages:
+        message += "\n\n[Action Required]\nFix the violations above and retry the commit.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and retry.\nRepeat until all violations are resolved."
+        output_result("deny", message)
+    else:
+        output_result("allow", message)
 
 
 if __name__ == "__main__":
