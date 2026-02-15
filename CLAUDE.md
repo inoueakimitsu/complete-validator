@@ -46,9 +46,9 @@ hooks/hooks.json (PreToolUse: Bash)
   │
   ▼
 scripts/check_style.sh
-  │  - tool_input.command が "git commit" で始まるか判定
+  │  - tool_input.command に "git commit" が含まれるか判定 (複合コマンド対応)
   │  - git commit 以外 → exit 0 (出力なし = 許可、数十ms)
-  │  - git commit → check_style.py --staged --plugin-dir に委譲
+  │  - git commit → 先行する git add を実行後、check_style.py --staged --plugin-dir に委譲
   │
   ▼
 scripts/check_style.py --staged --plugin-dir "$PLUGIN_DIR"
@@ -115,7 +115,11 @@ Plugin のメタデータを定義します。`name` がプラグイン名とし
 ### `scripts/check_style.sh`
 
 - stdin から hook JSON を受け取り、`tool_input.command` を python3 で抽出します
-- `git commit` で始まるコマンドのみ `check_style.py` に委譲し、それ以外は即 exit 0 です
+- コマンドを `&&`、`||`、`;` で分割し、いずれかのパートが `git commit` にマッチするか判定します
+  - `git commit -m "test"` — 単独コマンド
+  - `git add test.py && git commit -m "test"` — 複合コマンド (エージェントが頻繁に使用)
+  - `git -C /path commit -m "test"` — `-C` オプション付き
+- 複合コマンドの場合、`git commit` より前にある `git add` パートを先に実行します (後述の「PreToolUse hook の注意事項」を参照)
 - `CLAUDE_PLUGIN_ROOT` 環境変数があれば使用し、なければスクリプト位置から相対解決します (スタンドアロン互換)
 - jq 非依存です (python3 -c で JSON パース)
 
@@ -331,6 +335,12 @@ rm -f .complete-validator/cache.json
 
 ### テスト用プロジェクトの作成例
 
+**重要: PreToolUse hook は Claude Code エージェントの Bash ツール経由でのみ発火します。** 通常のシェルで `git commit` を実行してもバリデーションは走りません。テストは必ず Claude Code 内で実行してください。
+
+#### Step 1: シェルでプロジェクト準備
+
+通常のシェルでテスト用プロジェクトを作成し、initial commit まで済ませます (hook 不要)。
+
 ```bash
 mkdir /tmp/test-cv && cd /tmp/test-cv && git init
 
@@ -339,14 +349,42 @@ echo 'def hello(): pass' > test.py
 echo '# テストドキュメント' > test.md
 echo 'hello' > test.txt
 
-# *.py のみ commit → シナリオ 1
-git add test.py && git commit -m "test: py only"
+# initial commit (hook なしで OK)
+git add -A && git commit -m "initial commit"
+```
 
-# *.md のみ commit → シナリオ 2
-git add test.md && git commit -m "test: md only"
+#### Step 2: Claude Code 起動 + プラグインインストール
 
-# *.txt のみ commit → シナリオ 4
-git add test.txt && git commit -m "test: txt only"
+テスト用プロジェクトのディレクトリで Claude Code を起動し、プラグインをインストールします。
+
+```bash
+cd /tmp/test-cv
+claude
+```
+
+Claude Code 内で以下を実行します。
+
+```
+/plugin marketplace add inoueakimitsu/complete-validator
+/plugin install complete-validator@complete-validator --scope project
+```
+
+#### Step 3: Claude Code 内でテスト実行
+
+Claude Code 内でエージェントにファイル変更と commit を指示します。エージェントが Bash ツールで `git commit` を呼ぶことで hook が発火し、バリデーションが実行されます。
+
+```
+# シナリオ 1: *.py のみ → python_style + japanese_comment_style が適用される
+test.py に関数を追加して commit してください
+
+# シナリオ 2: *.md のみ → japanese_comment_style のみが適用される
+test.md にセクションを追加して commit してください
+
+# シナリオ 3: *.py + *.md 混在 → 各ファイルに正しいルールが適用される
+test.py と test.md を両方修正して commit してください
+
+# シナリオ 4: ルールなし → チェックがスキップされる
+test.txt を修正して commit してください
 ```
 
 ### 後片付け
@@ -354,9 +392,150 @@ git add test.txt && git commit -m "test: txt only"
 ```bash
 # テスト用プロジェクトの削除
 rm -rf /tmp/test-cv
+```
 
-# プラグインのアンインストール (テスト用プロジェクトから)
+Claude Code 内でプラグインをアンインストールする場合は以下を実行します。
+
+```
 /plugin uninstall complete-validator@complete-validator --scope project
+```
+
+### PreToolUse hook の注意事項
+
+E2E テストや開発時に知っておくべき PreToolUse hook の挙動です。
+
+#### hook はコマンド実行前に発火します
+
+PreToolUse hook は Bash ツールのコマンドが実行される**前**に発火します。これにより、以下の問題が発生します。
+
+エージェントは `git add test.py && git commit -m "..."` のように `git add` と `git commit` を**1 つの Bash ツール呼び出し**にまとめることが多いです。この場合、hook が発火した時点では `git add` がまだ実行されていないため、`git diff --cached` が空になり、`check_style.py` が「差分なし」として即 allow してしまいます。
+
+`check_style.sh` はこの問題に対処するため、複合コマンド内の `git commit` より前にある `git add` パートを抽出して先に実行します。これにより、`check_style.py` が staged diff を正しく取得できます。
+
+#### エージェントのコマンド形式は多様です
+
+エージェントが生成する `git commit` コマンドの形式は一定ではありません。`check_style.sh` は以下のすべてに対応する必要があります。
+
+- `git commit -m "message"` — 単独コマンド
+- `git add file && git commit -m "message"` — 複合コマンド (最も多い)
+- `git -C /path/to/repo commit -m "message"` — `-C` オプション付き
+- `git add file && git commit -m "$(cat <<'EOF'\nmessage\nEOF\n)"` — HEREDOC を使ったメッセージ
+
+#### hook が発火しているかの確認方法
+
+hook が発火しているかどうかは、キャッシュファイルの有無で判断できます。
+
+- `$GIT_TOPLEVEL/.complete-validator/cache.json` が作成される → hook が発火し、バリデーションが実行されました。
+- 作成されない → hook が発火していないか、`check_style.py` が差分なしで即終了しました。
+
+デバッグ時は `check_style.sh` の `LOG_FILE` (`$PLUGIN_DIR/.complete-validator/hook_debug.log`) に stderr が出力されます。
+
+#### プラグインはキャッシュから実行されます
+
+プラグインのインストール時にファイルが `~/.claude/plugins/cache/` 以下にコピーされます。ローカルのソースコードを編集しても、キャッシュ版には反映されません。
+
+- キャッシュの場所: `~/.claude/plugins/cache/complete-validator/complete-validator/<version>/`
+- 開発中にキャッシュ版を更新するには、キャッシュ版のファイルを直接上書きするか、プラグインを再インストールしてください。
+
+### tmux による自動テスト
+
+Claude Code の TUI を tmux の `send-keys`/`capture-pane` で操作することで、別の Claude Code セッション内で E2E テストを自動実行できます。
+
+#### 基本構成
+
+```bash
+# 1. tmux セッション作成
+tmux new-session -d -s test-cv -c /tmp/test-cv -x 200 -y 50
+
+# 2. Claude Code 起動 (ネスト検出回避 + 権限スキップ)
+tmux send-keys -t test-cv "env -u CLAUDECODE claude --dangerously-skip-permissions" Enter
+
+# 3. 起動待ち
+sleep 8
+
+# 4. プロンプト送信
+tmux send-keys -t test-cv "test.py に関数を追加して commit してください"
+sleep 0.5
+tmux send-keys -t test-cv Enter
+
+# 5. 結果取得 (hook 実行を含めて 2-3 分待つ)
+sleep 150
+tmux capture-pane -t test-cv -p -S -50
+
+# 6. クリーンアップ
+tmux send-keys -t test-cv Escape
+sleep 0.5
+tmux send-keys -t test-cv "/exit"
+sleep 0.5
+tmux send-keys -t test-cv Enter
+sleep 3
+tmux kill-session -t test-cv
+```
+
+#### tmux send-keys のコツ
+
+- **テキストと Enter は分けて送信します。** テキストを送った後、`sleep 0.5` を挟んでから `Enter` を送ります。同時に送ると Enter が改行として扱われることがあります。
+  ```bash
+  # Good
+  tmux send-keys -t test-cv "プロンプト文"
+  sleep 0.5
+  tmux send-keys -t test-cv Enter
+
+  # Bad (テキスト末尾の Enter が改行になることがある)
+  tmux send-keys -t test-cv "プロンプト文" Enter
+  ```
+- **入力のクリアには `Escape` + `C-u` を使います。** 入力バッファに残ったテキストをクリアできます。
+  ```bash
+  tmux send-keys -t test-cv Escape
+  sleep 0.5
+  tmux send-keys -t test-cv C-u
+  ```
+- **`Ctrl+C` で処理を中断できます。** エージェントの実行中に中断する場合に使います。
+  ```bash
+  tmux send-keys -t test-cv C-c
+  ```
+- **メニュー選択は `Down`/`Up` + `Enter` で操作します。** 権限確認ダイアログなどの操作に使います。
+  ```bash
+  tmux send-keys -t test-cv Down   # 2 番目の選択肢に移動
+  sleep 0.3
+  tmux send-keys -t test-cv Enter  # 確定
+  ```
+
+#### `env -u CLAUDECODE` が必要です
+
+Claude Code は `CLAUDECODE` 環境変数でネストセッションを検出します。Claude Code 内の Bash ツールから別の Claude Code を起動する場合、この環境変数を除去しないとエラーになります。
+
+```bash
+env -u CLAUDECODE claude --dangerously-skip-permissions
+```
+
+#### `--dangerously-skip-permissions` で承認を省略できます
+
+テスト時に毎回ツール実行の承認を行うのは非効率です。`--dangerously-skip-permissions` フラグで全ツールの権限チェックをスキップできます。このフラグなしの場合、`send-keys` で `Down` + `Enter` を送って各ダイアログを承認する必要があります。
+
+#### 待ち時間の目安
+
+| 操作 | 待ち時間 |
+|---|---|
+| Claude Code 起動 | 8 秒 |
+| `/plugin` コマンド | 5-10 秒 |
+| ファイル編集 + `git commit` (hook なし) | 30-60 秒 |
+| ファイル編集 + `git commit` (hook あり、キャッシュミス) | 2-3 分 |
+| ファイル編集 + `git commit` (hook あり、キャッシュヒット) | 30-60 秒 |
+
+#### capture-pane で結果を取得します
+
+```bash
+# 直近 50 行を取得
+tmux capture-pane -t test-cv -p -S -50
+
+# 特定のキーワードで hook 発火を確認
+tmux capture-pane -t test-cv -p -S -50 | grep -c "Blocked by hook"
+
+# hook が deny を返した場合、エージェントの出力に以下が含まれます
+#   PreToolUse:Bash hook returned blocking error
+#   Blocked by hook
+#   Error: Hook PreToolUse:Bash denied this tool
 ```
 
 ## バージョン管理
