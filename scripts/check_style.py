@@ -316,6 +316,8 @@ def build_prompt(
         "Be specific: state the file, line, and which rule is violated.",
         "If there are no violations, respond with exactly: 'No violations found.'",
         "",
+        "If the Task tool is available, you may use subagents to parallelize the validation work.",
+        "",
     ]
 
     # Rules Checklist
