@@ -340,11 +340,15 @@ def main() -> None:
         message += "\n\n[Warning]\n" + "\n".join(warnings)
     if has_violations:
         message += "\n\n[Action Required]\nFix the violations above and retry the commit. Repeat until all violations are resolved."
+    output_result("allow", message)
+
     cache[cache_key] = message
     save_cache(cache_path, cache)
 
-    output_result("allow", message)
-
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        output_result("allow", f"[Style check] Unexpected error: {e}")
+        sys.exit(0)
