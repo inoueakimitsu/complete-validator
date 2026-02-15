@@ -55,17 +55,19 @@ scripts/check_style.py --staged --project-dir "$PLUGIN_DIR"
   │  1. git diff --cached で staged diff 取得
   │  2. git diff --cached --name-only --diff-filter=d で全 staged ファイル取得
   │  3. rules/*.md をフロントマター付きで読み込み、ファイルとルールをマッチング
-  │  4. cache key = sha256(diff + rules) → キャッシュヒットなら即返却
-  │  5. git show :<path> で staged 版ファイル内容取得
-  │  6. プロンプト構築 (ルールとファイルの対応関係を明示 + diff)
-  │  7. claude -p でチェック実行 (CLAUDECODE 環境変数を除去してネスト検出回避)
-  │  8. 結果を {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"..."}} として stdout に出力
-  │  9. キャッシュ保存
+  │  4. .complete-validator/suppressions.md を読み込み (存在すれば)
+  │  5. cache key = sha256(diff + rules + suppressions) → キャッシュヒットなら即返却
+  │  6. git show :<path> で staged 版ファイル内容取得
+  │  7. プロンプト構築 (ルールとファイルの対応関係を明示 + diff + suppressions)
+  │  8. claude -p でチェック実行 (CLAUDECODE 環境変数を除去してネスト検出回避)
+  │  9. 違反あり → deny / 違反なし → allow として stdout に出力
+  │  10. キャッシュ保存
   │
   ▼
 Claude Code エージェント
-  - systemMessage として違反内容を受け取る
-  - エージェントが違反を修正してから再度 commit する
+  - 違反あり → deny でブロック、エージェントが修正して再 commit
+  - 偽陽性 → .complete-validator/suppressions.md に記述して再 commit
+  - 違反なし → allow で commit 成功
 ```
 
 ## Plugin ファイル構成
@@ -134,20 +136,22 @@ python3 scripts/check_style.py --project-dir DIR   # ルール/キャッシュ�
 1. **diff 取得** — working: `git diff` / staged: `git diff --cached`。空なら exit 0 (許可)
 2. **変更ファイル一覧取得** — `git diff --name-only --diff-filter=d` (staged 時は `--cached` 付き)
 3. **ルール読み込み** — `rules/` 内の全 `.md` ファイルをフロントマター付きで読み込み、`applies_to` パターンで対象ファイルをマッチング
-4. **キャッシュ確認** — `sha256(diff + rules)` をキーに `.complete-validator/cache.json` を参照
-5. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
-6. **プロンプト構築** — ルールとファイルの対応関係を明示したプロンプトを構築
-7. **`claude -p` 実行** — `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
-8. **結果出力** — `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"[Style Check Result]\n..."}}` を stdout に出力
-9. **キャッシュ保存** — 結果を cache.json に書き込み
+4. **suppressions 読み込み** — プロジェクトの `.complete-validator/suppressions.md` を読み込み (存在すれば)
+5. **キャッシュ確認** — `sha256(diff + rules + suppressions)` をキーに `.complete-validator/cache.json` を参照
+6. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
+7. **プロンプト構築** — ルールとファイルの対応関係を明示したプロンプトを構築 (suppressions があれば追加)
+8. **`claude -p` 実行** — `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
+9. **結果出力** — 違反あり → `"permissionDecision": "deny"` / 違反なし → `"allow"` として stdout に出力
+10. **キャッシュ保存** — 結果を cache.json に書き込み
 
 **`--project-dir` の自動検出:** 省略時は `git rev-parse --show-toplevel` で検出します。
 
 設計上の重要な判断です。
 
-- **常に `"permissionDecision": "allow"`** — commit をブロックしません。違反は additionalContext でエージェントに伝え、エージェントが修正します
-- **エラー時も allow** — `claude -p` のタイムアウト (90 秒) や失敗時は警告メッセージ付きで allow します
-- **キャッシュ** — 同じ diff + ルールの組み合わせなら `claude -p` を呼ばず即座にキャッシュ返却します
+- **違反あり → `"permissionDecision": "deny"`** — commit をブロックします。エージェントが違反を修正してから再 commit します
+- **偽陽性対策** — `.complete-validator/suppressions.md` に記述することで、既知の偽陽性を抑制できます
+- **エラー時は allow** — `claude -p` のタイムアウト (90 秒) や失敗時は警告メッセージ付きで allow します
+- **キャッシュ** — 同じ diff + ルール + suppressions の組み合わせなら `claude -p` を呼ばず即座にキャッシュ返却します
 
 ## ルールの追加方法
 
@@ -185,10 +189,29 @@ applies_to: ["*.py", "*.md"]
 ## キャッシュ
 
 - 保存場所は `.complete-validator/cache.json` です
-- キーは `sha256(diff + ルール全文)` です
-- diff またはルールが変わると自動的にキャッシュミスになります
+- キーは `sha256(diff + ルール全文 + suppressions)` です
+- diff、ルール、または suppressions が変わると自動的にキャッシュミスになります
 - キャッシュクリアは `rm -f .complete-validator/cache.json` です
 - `.gitignore` により Git 管理外です
+
+## 偽陽性の抑制 (suppressions)
+
+スタイルチェックで偽陽性が発生した場合、プロジェクトの `.complete-validator/suppressions.md` に記述することで抑制できます。
+
+- 保存場所はプロジェクト (git toplevel) の `.complete-validator/suppressions.md` です
+- フォーマットは自由記述の Markdown です。どのルールのどの検出が偽陽性かを説明してください
+- suppressions の内容はプロンプトに「既知の例外」として追加され、該当する場合は違反として報告されなくなります
+- suppressions を変更するとキャッシュキーが変わるため、次回の commit 時に自動的に再チェックが走ります
+- このファイルは Git 管理下に置くことを推奨します (チームで共有するため)
+
+例:
+
+```markdown
+# Suppressions
+
+- `python_style.md` の docstring 必須ルール: `__init__.py` の空ファイルには docstring 不要
+- `japanese_comment_style.md` の日本語コメントルール: 英語のライブラリ名はそのまま使用可
+```
 
 ## 前提条件
 

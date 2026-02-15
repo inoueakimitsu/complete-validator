@@ -6,8 +6,8 @@ Supports two modes:
   - working (default): checks unstaged changes (for on-demand use)
   - staged (--staged):  checks staged changes (for commit hooks)
 
-Always allows the commit — violations are reported via systemMessage
-so the Claude Code agent can fix them.
+Violations are denied (commit blocked) so the agent must fix them.
+False positives can be suppressed via .complete-validator/suppressions.md.
 """
 
 import argparse
@@ -145,9 +145,26 @@ def match_files_to_rules(
     return file_rules
 
 
-def compute_cache_key(diff: str, rules_content: str) -> str:
-    """Compute SHA256 hash of diff + rules for caching."""
-    content = diff + "\n---RULES---\n" + rules_content
+def load_suppressions(project_dir: Path) -> str:
+    """Load suppressions from .complete-validator/suppressions.md in the git toplevel.
+
+    Returns the file content, or empty string if the file doesn't exist.
+    """
+    git_toplevel = run_git("rev-parse", "--show-toplevel")
+    if not git_toplevel:
+        return ""
+    suppressions_path = Path(git_toplevel) / ".complete-validator" / "suppressions.md"
+    if not suppressions_path.exists():
+        return ""
+    try:
+        return suppressions_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def compute_cache_key(diff: str, rules_content: str, suppressions: str = "") -> str:
+    """Compute SHA256 hash of diff + rules + suppressions for caching."""
+    content = diff + "\n---RULES---\n" + rules_content + "\n---SUPPRESSIONS---\n" + suppressions
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
@@ -188,6 +205,7 @@ def build_prompt(
     file_rules: dict[str, list[tuple[str, str]]],
     files: dict[str, str],
     diff: str,
+    suppressions: str = "",
 ) -> str:
     """Build the prompt for Claude rule checking."""
     # Group rules by pattern set for readable sections
@@ -231,6 +249,12 @@ def build_prompt(
 
     parts.append("=== DIFF ===")
     parts.append(diff)
+
+    if suppressions:
+        parts.append("")
+        parts.append("=== KNOWN SUPPRESSIONS ===")
+        parts.append("以下は既知の例外です。これらに該当する場合は違反として報告しないでください。")
+        parts.append(suppressions)
 
     return "\n".join(parts)
 
@@ -306,15 +330,19 @@ def main() -> None:
             output_result("allow", "[Style Check]\n" + "\n".join(warnings))
         sys.exit(0)
 
+    # Load suppressions
+    suppressions = load_suppressions(project_dir)
+
     # Compute all rules content for cache key
     all_rules_content = "\n\n---\n\n".join(body for _, _, body in rules)
-    cache_key = compute_cache_key(diff, all_rules_content)
+    cache_key = compute_cache_key(diff, all_rules_content, suppressions)
     cache = load_cache(cache_path)
 
     if cache_key in cache:
         cached_message = cache[cache_key]
         if cached_message:
-            output_result("allow", cached_message)
+            cached_has_violations = "[action required]" in cached_message.lower()
+            output_result("deny" if cached_has_violations else "allow", cached_message)
         sys.exit(0)
 
     # Get file contents for matched files
@@ -331,7 +359,7 @@ def main() -> None:
         sys.exit(0)
 
     # Build prompt and run Claude
-    prompt = build_prompt(file_rules, files, diff)
+    prompt = build_prompt(file_rules, files, diff, suppressions)
 
     try:
         response = run_claude_check(prompt)
@@ -348,8 +376,8 @@ def main() -> None:
     if warnings:
         message += "\n\n[Warning]\n" + "\n".join(warnings)
     if has_violations:
-        message += "\n\n[Action Required]\nFix the violations above and retry the commit. Repeat until all violations are resolved."
-    output_result("allow", message)
+        message += "\n\n[Action Required]\nFix the violations above and retry the commit.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and retry.\nRepeat until all violations are resolved."
+    output_result("deny" if has_violations else "allow", message)
 
     cache[cache_key] = message
     save_cache(cache_path, cache)
