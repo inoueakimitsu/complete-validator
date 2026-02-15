@@ -51,6 +51,60 @@ applies_to: ["*.py", "*.md"]
 # ～の選択を行います。
 ```
 
+## docstring 必須
+
+すべての関数、クラス、メソッド (private を含む) に docstring を記述してください。引数がある場合は Parameters セクション、戻り値がある場合は Returns セクションも記述してください。
+
+**Bad:**
+```python
+def calculate_total(prices: list[float], tax_rate: float) -> float:
+    return sum(prices) * (1 + tax_rate)
+
+
+class DataProcessor:
+    def process(self, data: list[str]) -> list[str]:
+        return [d.strip() for d in data]
+```
+
+**Good:**
+```python
+def calculate_total(prices: list[float], tax_rate: float) -> float:
+    """税込み合計金額を計算します。
+
+    Parameters
+    ----------
+    prices: list[float]
+        商品価格のリストです。
+    tax_rate: float
+        税率です。
+
+    Returns
+    -------
+    float
+        税込み合計金額です。
+    """
+    return sum(prices) * (1 + tax_rate)
+
+
+class DataProcessor:
+    """データの前処理を行うクラスです。"""
+
+    def process(self, data: list[str]) -> list[str]:
+        """文字列リストの前後の空白を除去します。
+
+        Parameters
+        ----------
+        data: list[str]
+            処理対象の文字列リストです。
+
+        Returns
+        -------
+        list[str]
+            空白を除去した文字列リストです。
+        """
+        return [d.strip() for d in data]
+```
+
 ## NumPy 形式 docstring
 
 docstring は NumPy 形式で書いてください。Parameters と Returns 内もスタイルを合わせてください。
