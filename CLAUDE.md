@@ -1,6 +1,6 @@
 # CompleteValidator
 
-`rules/` 内の Markdown ルールに基づく AI スタイルチェックを実行する Claude Code Plugin です。
+`rules/` 内の Markdown ルールに基づく AI バリデーションを実行する Claude Code Plugin です。
 git commit 時の自動チェック (PreToolUse hook) と、任意のタイミングでのオンデマンドチェックの 2 つのモードをサポートします。
 検出した違反は systemMessage として Claude Code エージェントに返します。
 
@@ -196,7 +196,7 @@ applies_to: ["*.py", "*.md"]
 
 ## 偽陽性の抑制 (suppressions)
 
-スタイルチェックで偽陽性が発生した場合、プロジェクトの `.complete-validator/suppressions.md` に記述することで抑制できます。
+バリデーションで偽陽性が発生した場合、プロジェクトの `.complete-validator/suppressions.md` に記述することで抑制できます。
 
 - 保存場所はプロジェクト (git toplevel) の `.complete-validator/suppressions.md` です
 - フォーマットは自由記述の Markdown です。どのルールのどの検出が偽陽性かを説明してください
@@ -227,7 +227,7 @@ applies_to: ["*.py", "*.md"]
 # git commit 以外のコマンド → 即 exit 0 (出力なし)
 echo '{"tool_input":{"command":"git status"}}' | bash scripts/check_style.sh
 
-# git commit → スタイルチェック実行 (--staged --project-dir で委譲)
+# git commit → AI バリデーション実行 (--staged --project-dir で委譲)
 echo '{"tool_input":{"command":"git commit -m test"}}' | bash scripts/check_style.sh
 ```
 

@@ -1,11 +1,11 @@
 ---
 name: complete-validator
-description: git commit 時にルールベースの AI スタイルチェックを自動実行します。
+description: git commit 時にルールベースの AI バリデーションを自動実行します。
 ---
 
 # CompleteValidator
 
-`rules/` 内の Markdown ルールに基づく AI スタイルチェックを実行するプラグインです。
+`rules/` 内の Markdown ルールに基づく AI バリデーションを実行するプラグインです。
 
 ## 自動チェック (commit hook)
 
@@ -22,7 +22,7 @@ staged された変更に対してルールチェックを行い、違反があ�
 
 ## オンデマンドチェック
 
-commit 前に任意のタイミングでスタイルチェックを実行できます。
+commit 前に任意のタイミングでバリデーションを実行できます。
 
 ```bash
 # working (unstaged) な変更をチェック（デフォルト）

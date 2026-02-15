@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Style checker using Claude AI.
+"""AI validator using Claude.
 
-Checks files against rules defined in rules/*.md.
+Validates files against rules defined in rules/*.md.
 Supports two modes:
-  - working (default): checks unstaged changes (for on-demand use)
-  - staged (--staged):  checks staged changes (for commit hooks)
+  - working (default): validates unstaged changes (for on-demand use)
+  - staged (--staged):  validates staged changes (for commit hooks)
 
 Violations are denied (commit blocked) so the agent must fix them.
 False positives can be suppressed via .complete-validator/suppressions.md.
@@ -200,7 +200,7 @@ def run_claude_check(prompt: str) -> str:
         env=env,
     )
     if result.returncode != 0:
-        return f"[Style check error] claude exited with code {result.returncode}: {result.stderr.strip()}"
+        return f"[Validator error] claude exited with code {result.returncode}: {result.stderr.strip()}"
     return result.stdout.strip()
 
 
@@ -267,7 +267,7 @@ def build_prompt(
     diff_chunks = split_diff_by_file(diff)
 
     parts = [
-        "You are a strict style reviewer. You MUST check every rule listed for each file. Do not skip any rule.",
+        "You are a strict AI validator. You MUST check every rule listed for each file. Do not skip any rule.",
         "The diff is the primary check target. The full file content is provided for context only.",
         "If you are uncertain whether something is a violation, report it with a note that it needs confirmation.",
         "Be specific: state the file, line, and which rule is violated.",
@@ -347,7 +347,7 @@ def output_result(decision: str, message: str = "") -> None:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Style checker using Claude AI."
+        description="AI validator using Claude."
     )
     parser.add_argument(
         "--staged",
@@ -384,7 +384,7 @@ def main() -> None:
 
     # Output warnings for rule files without frontmatter
     if warnings and not rules:
-        output_result("allow", "[Style Check]\n" + "\n".join(warnings))
+        output_result("allow", "[Validator]\n" + "\n".join(warnings))
         sys.exit(0)
 
     if not rules:
@@ -395,7 +395,7 @@ def main() -> None:
     if not file_rules:
         # No changed files match any rule patterns
         if warnings:
-            output_result("allow", "[Style Check]\n" + "\n".join(warnings))
+            output_result("allow", "[Validator]\n" + "\n".join(warnings))
         sys.exit(0)
 
     # Load suppressions
@@ -432,15 +432,15 @@ def main() -> None:
     try:
         response = run_claude_check(prompt)
     except subprocess.TimeoutExpired:
-        output_result("allow", "[Style check] Timed out waiting for Claude response.")
+        output_result("allow", "[Validator] Timed out waiting for Claude response.")
         sys.exit(0)
     except Exception as e:
-        output_result("allow", f"[Style check] Error: {e}")
+        output_result("allow", f"[Validator] Error: {e}")
         sys.exit(0)
 
     # Cache and output result
     has_violations = "no violations found" not in response.lower()
-    message = f"[Style Check Result]\n{response}"
+    message = f"[Validator Result]\n{response}"
     if warnings:
         message += "\n\n[Warning]\n" + "\n".join(warnings)
     if has_violations:
@@ -455,5 +455,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        output_result("allow", f"[Style check] Unexpected error: {e}")
+        output_result("allow", f"[Validator] Unexpected error: {e}")
         sys.exit(0)
