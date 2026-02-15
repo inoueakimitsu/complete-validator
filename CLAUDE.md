@@ -110,7 +110,7 @@ Plugin のメタデータを定義します。`name` がプラグイン名とし
 - `PreToolUse` の `Bash` matcher で全 Bash ツール呼び出し時に発火します
 - `${CLAUDE_PLUGIN_ROOT}/scripts/check_style.sh` を実行します
 - Plugin インストール時に自動登録されます
-- タイムアウトは 120 秒です
+- タイムアウトは 600 秒です
 
 ### `scripts/check_style.sh`
 
@@ -158,8 +158,8 @@ python3 scripts/check_style.py --plugin-dir DIR    # プラグインディレク
 - **部分キャッシュ** — ルールファイル単位でキャッシュするため、1 つのルールだけ変更した場合でも他はキャッシュヒットします
 - **違反あり → `"permissionDecision": "deny"`** — commit をブロックします。エージェントが違反を修正してから再 commit します
 - **偽陽性対策** — `.complete-validator/suppressions.md` に記述することで、既知の偽陽性を抑制できます
-- **エラー時は allow** — `claude -p` のタイムアウト (90 秒) や失敗時は警告メッセージ付きで allow します
-- **deadline 管理** — hook の 120 秒タイムアウトの手前 (110 秒) を deadline とし、各 Future の取得時に残り時間を計算します
+- **エラー時は allow** — `claude -p` のタイムアウト (580 秒) や失敗時は警告メッセージ付きで allow します
+- **deadline 管理** — hook の 600 秒タイムアウトの手前 (590 秒) を deadline とし、各 Future の取得時に残り時間を計算します
 
 ## ルールの読み込み順序
 

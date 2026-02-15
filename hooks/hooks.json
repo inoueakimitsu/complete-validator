@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.sh",
-            "timeout": 120000
+            "timeout": 600000
           }
         ]
       }
