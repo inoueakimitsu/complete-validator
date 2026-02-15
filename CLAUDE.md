@@ -59,7 +59,7 @@ scripts/check_style.py --staged --project-dir "$PLUGIN_DIR"
   │  5. git show :<path> で staged 版ファイル内容取得
   │  6. プロンプト構築 (ルールとファイルの対応関係を明示 + diff)
   │  7. claude -p でチェック実行 (CLAUDECODE 環境変数を除去してネスト検出回避)
-  │  8. 結果を {"decision":"allow","systemMessage":"..."} として stdout に出力
+  │  8. 結果を {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"..."}} として stdout に出力
   │  9. キャッシュ保存
   │
   ▼
@@ -138,14 +138,14 @@ python3 scripts/check_style.py --project-dir DIR   # ルール/キャッシュ�
 5. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
 6. **プロンプト構築** — ルールとファイルの対応関係を明示したプロンプトを構築
 7. **`claude -p` 実行** — `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
-8. **結果出力** — `{"decision":"allow","systemMessage":"[Style Check Result]\n..."}` を stdout に出力
+8. **結果出力** — `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"[Style Check Result]\n..."}}` を stdout に出力
 9. **キャッシュ保存** — 結果を cache.json に書き込み
 
 **`--project-dir` の自動検出:** 省略時は `git rev-parse --show-toplevel` で検出します。
 
 設計上の重要な判断です。
 
-- **常に `"decision": "allow"`** — commit をブロックしません。違反は systemMessage でエージェントに伝え、エージェントが修正します
+- **常に `"permissionDecision": "allow"`** — commit をブロックしません。違反は additionalContext でエージェントに伝え、エージェントが修正します
 - **エラー時も allow** — `claude -p` のタイムアウト (90 秒) や失敗時は警告メッセージ付きで allow します
 - **キャッシュ** — 同じ diff + ルールの組み合わせなら `claude -p` を呼ばず即座にキャッシュ返却します
 

@@ -236,10 +236,19 @@ def build_prompt(
 
 
 def output_result(decision: str, message: str = "") -> None:
-    """Output hook result as JSON to stdout."""
-    result = {"decision": decision}
+    """Output hook result as JSON to stdout.
+
+    Uses the PreToolUse hookSpecificOutput format:
+    - permissionDecision: "allow" or "deny"
+    - additionalContext: injected into the agent's context
+    """
+    hook_output: dict = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+    }
     if message:
-        result["systemMessage"] = message
+        hook_output["additionalContext"] = message
+    result = {"hookSpecificOutput": hook_output}
     print(json.dumps(result))
 
 
