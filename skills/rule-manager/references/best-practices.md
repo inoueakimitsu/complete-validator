@@ -140,7 +140,7 @@ All public functions must have a docstring.
 
 ## ルールファイルの命名規則
 
-- スネークケース: `python_style.md`、`japanese_comment_style.md`
+- スネーク ケース: `python_style.md`、`japanese_comment_style.md`
 - 内容を端的に表す名前にする
 - 基本パターン: `{言語}_{関心事}.md`
 - 言語横断: 関心事のみ (例: `naming_convention.md`)
