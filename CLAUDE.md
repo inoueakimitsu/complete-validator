@@ -56,9 +56,9 @@ scripts/check_style.py --staged --project-dir "$PLUGIN_DIR"
   │  2. git diff --cached --name-only --diff-filter=d で全 staged ファイル取得
   │  3. rules/*.md をフロントマター付きで読み込み、ファイルとルールをマッチング
   │  4. .complete-validator/suppressions.md を読み込み (存在すれば)
-  │  5. cache key = sha256(diff + rules + suppressions) → キャッシュヒットなら即返却
+  │  5. cache key = sha256(prompt_version + diff + rules + suppressions) → キャッシュヒットなら即返却
   │  6. git show :<path> で staged 版ファイル内容取得
-  │  7. プロンプト構築 (ルールとファイルの対応関係を明示 + diff + suppressions)
+  │  7. プロンプト構築 (ファイルごとにルール・diff・全文をインターリーブ配置 + suppressions)
   │  8. claude -p でチェック実行 (CLAUDECODE 環境変数を除去してネスト検出回避)
   │  9. 違反あり → deny / 違反なし → allow として stdout に出力
   │  10. キャッシュ保存
@@ -137,9 +137,9 @@ python3 scripts/check_style.py --project-dir DIR   # ルール/キャッシュ�
 2. **変更ファイル一覧取得** — `git diff --name-only --diff-filter=d` (staged 時は `--cached` 付き)
 3. **ルール読み込み** — `rules/` 内の全 `.md` ファイルをフロントマター付きで読み込み、`applies_to` パターンで対象ファイルをマッチング
 4. **suppressions 読み込み** — プロジェクトの `.complete-validator/suppressions.md` を読み込み (存在すれば)
-5. **キャッシュ確認** — `sha256(diff + rules + suppressions)` をキーに `.complete-validator/cache.json` を参照
+5. **キャッシュ確認** — `sha256(prompt_version + diff + rules + suppressions)` をキーに `.complete-validator/cache.json` を参照
 6. **ファイル内容取得** — staged: `git show :<path>` / working: ファイルを直接読み込み
-7. **プロンプト構築** — ルールとファイルの対応関係を明示したプロンプトを構築 (suppressions があれば追加)
+7. **プロンプト構築** — ファイルごとにルール・diff・全文をインターリーブ配置したプロンプトを構築 (チェックリスト + suppressions + リマインダー付き)
 8. **`claude -p` 実行** — `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
 9. **結果出力** — 違反あり → `"permissionDecision": "deny"` / 違反なし → `"allow"` として stdout に出力
 10. **キャッシュ保存** — 結果を cache.json に書き込み
@@ -189,7 +189,7 @@ applies_to: ["*.py", "*.md"]
 ## キャッシュ
 
 - 保存場所は `.complete-validator/cache.json` です
-- キーは `sha256(diff + ルール全文 + suppressions)` です
+- キーは `sha256(prompt_version + ルール全文 + diff + suppressions)` です
 - diff、ルール、または suppressions が変わると自動的にキャッシュミスになります
 - キャッシュクリアは `rm -f .complete-validator/cache.json` です
 - `.gitignore` により Git 管理外です

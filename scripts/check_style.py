@@ -21,6 +21,9 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 
+PROMPT_VERSION = "2"
+
+
 def run_git(*args: str) -> str:
     """Run a git command and return stdout."""
     result = subprocess.run(
@@ -163,8 +166,8 @@ def load_suppressions(project_dir: Path) -> str:
 
 
 def compute_cache_key(diff: str, rules_content: str, suppressions: str = "") -> str:
-    """Compute SHA256 hash of diff + rules + suppressions for caching."""
-    content = diff + "\n---RULES---\n" + rules_content + "\n---SUPPRESSIONS---\n" + suppressions
+    """Compute SHA256 hash of prompt version + diff + rules + suppressions for caching."""
+    content = PROMPT_VERSION + "\n---RULES---\n" + rules_content + "\n---DIFF---\n" + diff + "\n---SUPPRESSIONS---\n" + suppressions
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
@@ -201,60 +204,125 @@ def run_claude_check(prompt: str) -> str:
     return result.stdout.strip()
 
 
+def split_diff_by_file(diff: str) -> dict[str, str]:
+    """Split a unified diff into per-file chunks.
+
+    Parses on 'diff --git a/... b/...' boundaries.
+    Returns a dict mapping file path to its diff chunk.
+    Falls back to empty dict if parsing fails.
+    """
+    chunks: dict[str, str] = {}
+    current_path: str | None = None
+    current_lines: list[str] = []
+
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            # Flush previous chunk
+            if current_path is not None:
+                chunks[current_path] = "".join(current_lines)
+            # Extract b/ path: 'diff --git a/foo b/bar' -> 'bar'
+            parts = line.strip().split(" b/", 1)
+            current_path = parts[1] if len(parts) == 2 else None
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    # Flush last chunk
+    if current_path is not None:
+        chunks[current_path] = "".join(current_lines)
+
+    return chunks
+
+
+def extract_rule_headings(rule_body: str) -> list[str]:
+    """Extract ## headings from a rule body for the checklist."""
+    headings = []
+    for line in rule_body.splitlines():
+        if line.startswith("## "):
+            headings.append(line[3:].strip())
+    return headings
+
+
 def build_prompt(
     file_rules: dict[str, list[tuple[str, str]]],
     files: dict[str, str],
     diff: str,
     suppressions: str = "",
 ) -> str:
-    """Build the prompt for Claude rule checking."""
-    # Group rules by pattern set for readable sections
-    pattern_groups: dict[str, list[str]] = {}
-    for file_path, rule_list in file_rules.items():
-        ext = os.path.splitext(file_path)[1]
-        key = f"*{ext}" if ext else os.path.basename(file_path)
-        for rule_name, rule_body in rule_list:
-            pattern_groups.setdefault(key, [])
-            if rule_name not in pattern_groups[key]:
-                pattern_groups[key].append(rule_name)
+    """Build the prompt for Claude rule checking.
 
-    # Collect all unique rule bodies keyed by rule name
-    rule_bodies: dict[str, str] = {}
+    Uses a per-file interleaved structure:
+      System instructions -> Rules Checklist -> per-file (rules, diff, full content) -> Suppressions -> Reminder
+    """
+    # Collect all unique rule headings for the checklist
+    all_headings: list[str] = []
+    seen_rules: set[str] = set()
     for rule_list in file_rules.values():
         for rule_name, rule_body in rule_list:
-            if rule_name not in rule_bodies:
-                rule_bodies[rule_name] = rule_body
+            if rule_name not in seen_rules:
+                seen_rules.add(rule_name)
+                all_headings.extend(extract_rule_headings(rule_body))
+
+    # Split diff into per-file chunks
+    diff_chunks = split_diff_by_file(diff)
 
     parts = [
-        "You are a reviewer. Check the following files against the applicable rules.",
-        "Report ONLY actual violations found in the files. Be specific: state the file, line, and which rule is violated.",
+        "You are a strict style reviewer. You MUST check every rule listed for each file. Do not skip any rule.",
+        "The diff is the primary check target. The full file content is provided for context only.",
+        "If you are uncertain whether something is a violation, report it with a note that it needs confirmation.",
+        "Be specific: state the file, line, and which rule is violated.",
         "If there are no violations, respond with exactly: 'No violations found.'",
         "",
     ]
 
-    # Rules sections grouped by file pattern
-    for pattern, rule_names in sorted(pattern_groups.items()):
-        parts.append(f"=== RULES FOR {pattern} FILES ===")
-        for rule_name in rule_names:
-            parts.append(f"--- {rule_name} ---")
-            parts.append(rule_bodies[rule_name])
+    # Rules Checklist
+    if all_headings:
+        parts.append("## Rules Checklist")
+        parts.append("You must check each of the following rules for every applicable file:")
+        for heading in all_headings:
+            parts.append(f"- [ ] {heading}")
+        parts.append("")
+
+    # Per-file interleaved sections
+    for file_path, rule_list in file_rules.items():
+        if file_path not in files:
+            continue
+
+        parts.append(f"=== FILE: {file_path} ===")
+        parts.append("")
+
+        # Applicable rules for this file
+        parts.append("--- Applicable Rules ---")
+        for rule_name, rule_body in rule_list:
+            parts.append(f"[{rule_name}]")
+            parts.append(rule_body)
             parts.append("")
+
+        # Diff for this file (primary check target)
+        parts.append("--- Changes (primary check target) ---")
+        file_diff = diff_chunks.get(file_path, "")
+        if file_diff:
+            parts.append(file_diff)
+        else:
+            parts.append("(no diff available for this file)")
         parts.append("")
 
-    parts.append("=== CHANGED FILES ===")
-    for path, content in files.items():
-        parts.append(f"--- {path} ---")
-        parts.append(content)
+        # Full content for context
+        parts.append("--- Full Content (for context) ---")
+        parts.append(files[file_path])
         parts.append("")
 
-    parts.append("=== DIFF ===")
-    parts.append(diff)
-
+    # Suppressions
     if suppressions:
-        parts.append("")
         parts.append("=== KNOWN SUPPRESSIONS ===")
         parts.append("以下は既知の例外です。これらに該当する場合は違反として報告しないでください。")
         parts.append(suppressions)
+        parts.append("")
+
+    # Reminder
+    parts.append("## Reminder")
+    parts.append("Confirm that you have checked every rule in the checklist above for each applicable file.")
+    parts.append("Do not skip any rule. Report all violations found.")
 
     return "\n".join(parts)
 
