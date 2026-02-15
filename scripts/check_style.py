@@ -293,9 +293,12 @@ def main() -> None:
         sys.exit(0)
 
     # Cache and output result
+    has_violations = "no violations found" not in response.lower()
     message = f"[Style Check Result]\n{response}"
     if warnings:
         message += "\n\n[Warning]\n" + "\n".join(warnings)
+    if has_violations:
+        message += "\n\n[Action Required]\nFix the violations above and retry the commit. Repeat until all violations are resolved."
     cache[cache_key] = message
     save_cache(cache_path, cache)
 
