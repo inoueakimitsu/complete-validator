@@ -1,7 +1,7 @@
 # CompleteValidator
 
 `rules/` 内の Markdown ルールに基づく AI バリデーションを実行する Claude Code Plugin です。
-git commit 時の自動チェック (PreToolUse hook) と、任意のタイミングでのオンデマンドチェックの 2 つのモードをサポートします。
+git commit 時の自動チェック (PreToolUse hook) と、任意のタイミングでのオンデマンド チェックの 2 つのモードをサポートします。
 検出した違反は systemMessage として Claude Code エージェントに返します。
 
 ## インストール
@@ -116,9 +116,9 @@ Plugin のメタデータを定義します。 `name` がプラグイン名と�
 
 - stdin から hook JSON を受け取り、`tool_input.command` を python3 で抽出します。
 - コマンドを `&&`、`||`、`;` で分割し、いずれかのパートが `git commit` にマッチするか判定します。
-  - `git commit -m "test"`: 単独コマンド
-  - `git add test.py && git commit -m "test"`: 複合コマンド (エージェントが頻繁に使用)
-  - `git -C /path commit -m "test"`: `-C` オプション付き
+  - `git commit -m "test"` (単独コマンド)
+  - `git add test.py && git commit -m "test"` (複合コマンド、エージェントが頻繁に使用)
+  - `git -C /path commit -m "test"` (`-C` オプション付き)
 - 複合コマンドの場合、`git commit` より前にある `git add` パートを先に実行します。詳細は後述の「PreToolUse hook の注意事項」を参照してください。
 - `CLAUDE_PLUGIN_ROOT` 環境変数があれば使用し、なければスクリプト位置からスタンドアロン互換で相対解決します。
 - jq 非依存で、python3 -c で JSON をパースします。
@@ -137,29 +137,29 @@ python3 scripts/check_style.py --staged            # staged モード
 python3 scripts/check_style.py --plugin-dir DIR    # プラグイン ディレクトリを指定 (組み込みルールの場所)
 ```
 
-**処理フロー:**
+**処理フロー**
 
-1. **diff 取得**: working: `git diff` / staged: `git diff --cached`。空なら exit 0 (許可)
-2. **変更ファイル一覧取得**: `git diff --name-only --diff-filter=d` (staged 時は `--cached` 付き)
-3. **ルール読み込み**: CWD から上方向に `.complete-validator/rules/` を探索し、プラグイン組み込み `rules/` とマージ (nearest wins)。`applies_to` パターンで対象ファイルをマッチング
-4. **suppressions 読み込み**: プロジェクトの `.complete-validator/suppressions.md` を読み込み (存在すれば)
-5. **ファイル内容取得**: staged: `git show :<path>` / working: ファイルを直接読み込み
-6. **ルール ファイルごとに並列チェック**: `ThreadPoolExecutor` でルール ファイル単位に `claude -p` を並列実行:
-   a. **キャッシュ確認**: `sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)` をキーに部分キャッシュを参照
-   b. **プロンプト構築**: 1 ルール ファイル + 該当ファイルの diff/全文 + suppressions
-   c. **`claude -p` 実行**: `CLAUDECODE` 環境変数を除去して実行 (ネストセッション検出を回避)
-   d. **キャッシュ保存**: ルール単位でキャッシュ
-7. **結果集約**: 全ルールの結果をルール ファイル名でソートして集約。deny が 1 つでもあれば全体 deny
+1. **diff 取得**: working モードでは `git diff`、staged モードでは `git diff --cached` を使用します。空なら exit 0 で許可します。
+2. **変更ファイル一覧取得**: `git diff --name-only --diff-filter=d` で取得します。staged 時は `--cached` を付与します。
+3. **ルール読み込み**: CWD から上方向に `.complete-validator/rules/` を探索し、プラグイン組み込み `rules/` とマージします (nearest wins)。`applies_to` パターンで対象ファイルを絞り込みます。
+4. **suppressions 読み込み**: プロジェクトの `.complete-validator/suppressions.md` が存在すれば読み込みます。
+5. **ファイル内容取得**: staged モードでは `git show :<path>`、working モードではファイルを直接読み込みます。
+6. **ルール ファイルごとに並列チェック**: `ThreadPoolExecutor` でルール ファイル単位に `claude -p` を並列実行します。
+   a. **キャッシュ確認**: `sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)` をキーに部分キャッシュを参照します。
+   b. **プロンプト構築**: 1 ルール ファイル + 該当ファイルの diff/全文 + suppressions で構成します。
+   c. **`claude -p` 実行**: `CLAUDECODE` 環境変数を除去してネストセッション検出を回避しつつ実行します。
+   d. **キャッシュ保存**: ルール単位でキャッシュします。
+7. **結果集約**: 全ルールの結果をルール ファイル名でソートして集約します。deny が 1 つでもあれば全体 deny になります。
 
 設計上の重要な判断です。
 
-- **ルール ファイル単位の分割実行**: 各 `claude -p` のプロンプトが小さくなり、検出精度が向上します
-- **並列実行**: ルール ファイル数分のワーカーで並列実行し、全体の実行時間を短縮します
-- **部分キャッシュ**: ルール ファイル単位でキャッシュするため、1 つのルールだけ変更した場合でも他はキャッシュ ヒットします
-- **違反あり → `"permissionDecision": "deny"`**: commit をブロックします。エージェントが違反を修正してから再 commit します
-- **偽陽性対策**: `.complete-validator/suppressions.md` に記述することで、既知の偽陽性を抑制できます
-- **エラー時は allow**: `claude -p` のタイムアウト (580 秒) や失敗時は警告メッセージ付きで allow します
-- **deadline 管理**: hook の 600 秒タイムアウトの手前 (590 秒) を deadline とし、各 Future の取得時に残り時間を計算します
+- **ルール ファイル単位の分割実行**: 各 `claude -p` のプロンプトが小さくなり、検出精度が向上します。
+- **並列実行**: ルール ファイル数分のワーカーで並列実行し、全体の実行時間を短縮します。
+- **部分キャッシュ**: ルール ファイル単位でキャッシュするため、1 つのルールだけ変更した場合でも他はキャッシュ ヒットします。
+- **違反ありの場合は `"permissionDecision": "deny"`**: commit をブロックします。エージェントが違反を修正してから再 commit します。
+- **偽陽性対策**: `.complete-validator/suppressions.md` に記述することで、既知の偽陽性を抑制できます。
+- **エラー時は allow**: `claude -p` のタイムアウト (580 秒) や失敗時は警告メッセージ付きで allow します。
+- **deadline 管理**: hook の 600 秒タイムアウトの手前 (590 秒) を deadline とし、各 Future の取得時に残り時間を計算します。
 
 ## ルールの読み込み順序
 
@@ -330,7 +330,7 @@ rm -f .complete-validator/cache.json
 | 1 | `*.py` のみ commit | python_style + japanese_comment_style が適用される |
 | 2 | `*.md` のみ commit | japanese_comment_style のみが適用される |
 | 3 | `*.py` + `*.md` 混在 commit | 各ファイルに正しいルールが適用される |
-| 4 | どのルールにもマッチしない拡張子のみ (例: `*.txt`) | チェックがスキップされる |
+| 4 | どのルールにもマッチしない拡張子のみ (`*.txt` など) | チェックがスキップされる |
 | 5 | `applies_to` なしのルール ファイルを追加 | スキップされ、警告メッセージが出る |
 
 ### テスト用プロジェクトの作成例
@@ -416,17 +416,17 @@ PreToolUse hook は Bash ツールのコマンドが実行される**前**に発
 
 エージェントが生成する `git commit` コマンドの形式は一定ではありません。`check_style.sh` は以下のすべてに対応する必要があります。
 
-- `git commit -m "message"`: 単独コマンド
-- `git add file && git commit -m "message"`: 複合コマンド (最も多い)
-- `git -C /path/to/repo commit -m "message"`: `-C` オプション付き
-- `git add file && git commit -m "$(cat <<'EOF'\nmessage\nEOF\n)"`: HEREDOC を使ったメッセージ
+- `git commit -m "message"` (単独コマンド)
+- `git add file && git commit -m "message"` (複合コマンド、最も多い)
+- `git -C /path/to/repo commit -m "message"` (`-C` オプション付き)
+- `git add file && git commit -m "$(cat <<'EOF'\nmessage\nEOF\n)"` (HEREDOC を使ったメッセージ)
 
 #### hook が発火しているかの確認方法
 
 hook が発火しているかどうかは、キャッシュ ファイルの有無で判断できます。
 
-- `$GIT_TOPLEVEL/.complete-validator/cache.json` が作成される → hook が発火し、バリデーションが実行されました。
-- 作成されない → hook が発火していないか、`check_style.py` が差分なしで即終了しました。
+- `$GIT_TOPLEVEL/.complete-validator/cache.json` が作成されていれば、hook が発火してバリデーションが実行されています。
+- 作成されていなければ、hook が発火していないか、`check_style.py` が差分なしで即終了しています。
 
 デバッグ時は `check_style.sh` の `LOG_FILE` (`$PLUGIN_DIR/.complete-validator/hook_debug.log`) に stderr が出力されます。
 
@@ -434,12 +434,12 @@ hook が発火しているかどうかは、キャッシュ ファイルの有�
 
 プラグインのインストール時にファイルが `~/.claude/plugins/cache/` 以下にコピーされます。ローカルのソースコードを編集しても、キャッシュ版には反映されません。
 
-- キャッシュの場所: `~/.claude/plugins/cache/complete-validator/complete-validator/<version>/`
+- キャッシュは `~/.claude/plugins/cache/complete-validator/complete-validator/<version>/` に保存されます。
 - 開発中にキャッシュ版を更新するには、キャッシュ版のファイルを直接上書きするか、プラグインを再インストールしてください。
 
 ### tmux による自動テスト
 
-Claude Code の TUI を tmux の `send-keys`/`capture-pane` で操作することで、別の Claude Code セッション内で E2E テストを自動実行できます。
+Claude Code の TUI を tmux の `send-keys` と `capture-pane` で操作することで、別の Claude Code セッション内で E2E テストを自動実行できます。
 
 #### 基本構成
 

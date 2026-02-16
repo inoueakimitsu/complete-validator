@@ -27,7 +27,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 
-# v3: ルール ファイル単位の分割並列実行に変更しています (v2 は全ルール一括、v1 はファイル単位)。
+# v3: ルール ファイル単位の分割並列実行に変更しています。v2 は全ルール一括、v1 はファイル単位でした。
 PROMPT_VERSION = "3"
 
 # (rule_filename, glob_patterns, body) のリストです。

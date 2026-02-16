@@ -10,14 +10,14 @@ description: git commit 時にルールベースの AI バリデーションを�
 ## 自動チェック (commit hook)
 
 PreToolUse hook により、Bash ツールで `git commit` が実行される際に自動で発火します。
-staged された変更に対してルールチェックを行い、違反があれば deny で commit をブロックします。
+staged された変更に対してルール チェックを行い、違反があれば deny で commit をブロックします。
 
 ### 違反が検出されたとき
 
 1. 違反内容を確認し、修正が必要か偽陽性かを判断します。
-2. 明らかな違反 → コードを修正して再 commit します。
-3. 偽陽性の可能性がある場合 → **必ずユーザーに確認します**。ユーザーに違反内容を提示し、修正すべきか偽陽性として抑制すべきかを質問します。
-4. ユーザーが偽陽性と判断した場合 → プロジェクトの `.complete-validator/suppressions.md` に抑制理由を追記し、再 commit します。
+2. 明らかな違反であればコードを修正して再 commit します。
+3. 偽陽性の可能性がある場合は**必ずユーザーに確認します**。ユーザーに違反内容を提示し、修正すべきか偽陽性として抑制すべきかを質問します。
+4. ユーザーが偽陽性と判断した場合はプロジェクトの `.complete-validator/suppressions.md` に抑制理由を追記し、再 commit します。
 5. 全ての違反が解消されるまで繰り返します。
 
 ## オンデマンド チェック
@@ -44,8 +44,8 @@ diff に関係なく、リポジトリ内の全 tracked ファイルをルール
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${CLAUDE_PLUGIN_ROOT}
 ```
 
-- 違反あり → exit code 1、違反内容を stderr に出力します。
-- 違反なし → exit code 0 を返します。
+- 違反がある場合は exit code 1 を返し、違反内容を stderr に出力します。
+- 違反がない場合は exit code 0 を返します。
 - 結果はキャッシュされ、ファイル内容が変わらなければ再実行時にキャッシュ ヒットします。
 
 ## 偽陽性の抑制 (suppressions)
@@ -55,7 +55,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${
 ユーザーが偽陽性と判断した場合、以下の形式で追記してください。
 
 ```markdown
-- `<ルールファイル名>` の <ルール名>: <抑制理由の説明>
+- `<ルール ファイル名>` の <ルール名>: <抑制理由の説明>
 ```
 
 このファイルは Git 管理下に置いてください。内容が変わるとキャッシュが無効化され、次回 commit 時に再チェックされます。
