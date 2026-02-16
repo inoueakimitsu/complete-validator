@@ -48,6 +48,45 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${
 - 違反がない場合は exit code 0 を返します。
 - 結果はキャッシュされ、ファイル内容が変わらなければ再実行時にキャッシュ ヒットします。
 
+## ストリーム モード
+
+バックグラウンドで per-file のバリデーションを実行し、結果をポーリングしながら逐次修正できるモードです。ルール数やファイル数が多い場合に、hook の 600 秒タイムアウトを回避しつつ効率的にチェックできます。
+
+### ワークフロー
+
+1. ストリーム チェックを開始して stream-id を取得します。
+
+```bash
+# working (unstaged) な変更をストリーム チェック
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --stream --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+
+# staged な変更をストリーム チェック
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --stream --staged --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+```
+
+stream-id が stdout に出力されます。バックグラウンドでワーカーが起動し、ルール × ファイルの各ペアを並列チェックします。
+
+2. status.json をポーリングして進捗を確認します。
+
+```bash
+cat .complete-validator/stream-results/<stream-id>/status.json
+```
+
+`completed_units` が増加し、最終的に `status` が `"completed"` になります。
+
+3. deny の結果を確認して修正します。
+
+```bash
+# 個別結果を確認します。
+cat .complete-validator/stream-results/<stream-id>/results/*.json
+```
+
+各結果ファイルには `rule_name`、`file_path`、`status`、`message`、`cache_hit` が含まれます。
+
+4. 修正後に再チェックします。キャッシュ ヒットした箇所は即座に完了するため、修正した箇所のみが再実行されます。
+
+5. 全結果が allow になったら commit します。hook 側は per-file キャッシュの preflight により高速パスで通過します。
+
 ## 偽陽性の抑制 (suppressions)
 
 プロジェクトの `.complete-validator/suppressions.md` に記述すると、該当する検出が抑制されます。

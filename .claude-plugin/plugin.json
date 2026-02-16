@@ -1,6 +1,6 @@
 {
   "name": "complete-validator",
-  "version": "1.13.2",
+  "version": "1.14.0",
   "description": "git commit 時に rules/ 内の Markdown ルールに基づく AI バリデーションを自動実行するプラグイン",
   "keywords": ["style-check", "linting", "commit-hook", "japanese"],
   "license": "MIT"

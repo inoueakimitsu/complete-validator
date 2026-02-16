@@ -1,7 +1,7 @@
 # CompleteValidator
 
 `rules/` 内の Markdown ルールに基づく AI バリデーションを実行する Claude Code Plugin です。
-git commit 時の自動チェック (PreToolUse hook) と、任意のタイミングでのオンデマンド チェックの 2 つのモードをサポートします。
+git commit 時の自動チェック (PreToolUse hook)、任意のタイミングでのオンデマンド チェック、バックグラウンド ストリーム チェックの 3 つのモードをサポートします。
 検出した違反は systemMessage として Claude Code エージェントに返します。
 
 ## インストール
@@ -72,6 +72,48 @@ Claude Code エージェント
   - 違反なし → allow で commit 成功
 ```
 
+### ストリーム モード アーキテクチャ
+
+```
+Claude Code エージェント
+  │
+  │  python3 check_style.py --stream [--staged] --plugin-dir ...
+  │
+  ▼
+check_style.py --stream
+  │  1. stream-id 生成 (YYYYMMDD-HHMMSS-<random6>)
+  │  2. .complete-validator/stream-results/<stream-id>/ 作成
+  │  3. 古い結果ディレクトリを最新 5 件のみ保持するようクリーンアップ
+  │  4. subprocess.Popen で子プロセス (--stream-worker) を起動 (start_new_session=True)
+  │  5. stream-id を stdout に出力して即 exit 0
+  │
+  ▼
+check_style.py --stream-worker --stream-id <id>
+  │  1. ルールとファイルを読み込み
+  │  2. (rule_file, individual_file) ペアを列挙
+  │  3. ThreadPoolExecutor で並列実行 (max 16 ワーカー)
+  │  4. 完了するたびに per-file 結果ファイルと status.json を更新
+  │
+  ▼
+.complete-validator/stream-results/<stream-id>/
+  ├── status.json        # 進捗 (total_units, completed_units, status, summary)
+  ├── worker.log         # ワーカー ログ
+  └── results/
+      ├── <rule>__<hash>.json  # per-file 結果
+      └── ...
+  │
+  ▼
+Claude Code エージェント
+  - status.json をポーリングして進捗確認
+  - deny の結果を確認して修正
+  - 修正後に再チェック (キャッシュ ヒットで高速)
+  - 全 allow なら commit (hook は per-file preflight で高速パス)
+```
+
+ストリーム モードの処理単位は **1 ルール ファイル × 1 個別ファイル** です。既存の hook モードはルール ファイル単位 (1 ルール × 全マッチ ファイル) ですが、ストリーム モードではより細かい粒度で実行します。
+
+ストリーム モードで蓄積された per-file キャッシュは、hook 実行時の preflight で参照されます。全マッチ ファイルの per-file キャッシュがヒットすれば、`claude -p` を実行せず即返却します。
+
 ## Plugin ファイル構成
 
 ```
@@ -87,7 +129,15 @@ complete-validator/
 │   └── complete-validator/
 │       └── SKILL.md             # スキル定義 (ルール概要、使い方)
 ├── rules/
-│   └── *.md # 各種ルール
+│   ├── python_style.md                # Python スタイル ルール
+│   ├── readable_code/                 # リーダブルコード ルール (セクション分割)
+│   │   ├── 01_basics.md
+│   │   ├── ...
+│   │   └── 11_review.md
+│   └── japanese_comment_style/        # 日本語コメント スタイル ルール (ルール分割)
+│       ├── 01_taigendome.md
+│       ├── ...
+│       └── 13_trailing_paren.md
 ├── scripts/
 │   ├── check_style.sh           # hook エントリ ポイント (シェルラッパー)
 │   └── check_style.py           # チェック本体
@@ -125,37 +175,53 @@ Plugin のメタデータを定義します。 `name` がプラグイン名と�
 
 ### `scripts/check_style.py`
 
-主要な処理フローです。 2 つのモードをサポートします。
+主要な処理フローです。 4 つのモードをサポートします。
 
 - **working モード** (デフォルト): `git diff` で unstaged な変更をチェックします。オンデマンド実行用です。
 - **staged モード** (`--staged`): `git diff --cached` で staged な変更をチェックします。commit hook 用です。
+- **full-scan モード** (`--full-scan`): 全 tracked ファイルをチェックします。既存コードのスキャン用です。
+- **stream モード** (`--stream`): バックグラウンドで per-file チェックを実行し、結果をファイルに逐次出力します。
 
 **CLI:**
 ```bash
 python3 scripts/check_style.py                    # working モード (デフォルト)
 python3 scripts/check_style.py --staged            # staged モード
+python3 scripts/check_style.py --full-scan         # フル スキャン モード
+python3 scripts/check_style.py --stream            # ストリーム モード
+python3 scripts/check_style.py --stream --staged   # ストリーム モード (staged)
 python3 scripts/check_style.py --plugin-dir DIR    # プラグイン ディレクトリを指定 (組み込みルールの場所)
 ```
 
-**処理フロー**
+**処理フロー (hook/オンデマンド)**
 
 1. **diff 取得**: working モードでは `git diff`、staged モードでは `git diff --cached` を使用します。空なら exit 0 で許可します。
 2. **変更ファイル一覧取得**: `git diff --name-only --diff-filter=d` で取得します。staged 時は `--cached` を付与します。
-3. **ルール読み込み**: CWD から上方向に `.complete-validator/rules/` を探索し、プラグイン組み込み `rules/` とマージします (nearest wins)。`applies_to` パターンで対象ファイルを絞り込みます。
+3. **ルール読み込み**: CWD から上方向に `.complete-validator/rules/` を再帰探索 (`rglob`) し、プラグイン組み込み `rules/` とマージします (nearest wins)。`applies_to` パターンで対象ファイルを絞り込みます。ルール名はディレクトリ相対パス (例: `readable_code/02_naming.md`) です。
 4. **suppressions 読み込み**: プロジェクトの `.complete-validator/suppressions.md` が存在すれば読み込みます。
 5. **ファイル内容取得**: staged モードでは `git show :<path>`、working モードではファイルを直接読み込みます。
-6. **ルール ファイルごとに並列チェック**: `ThreadPoolExecutor` でルール ファイル単位に `claude -p` を並列実行します。
-   a. **キャッシュ確認**: `sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)` をキーに部分キャッシュを参照します。
+6. **per-file cache preflight**: ストリーム モードで蓄積された per-file キャッシュを確認します。全マッチ ファイルが per-file キャッシュでヒットすれば、`claude -p` を実行せず即返却します。
+7. **ルール ファイルごとに並列チェック**: `ThreadPoolExecutor` でルール ファイル単位に `claude -p` を並列実行します。
+   a. **キャッシュ確認**: `sha256(prompt_version + granularity + rule_name + file_path + rule_body + diff + suppressions)` をキーに部分キャッシュを参照します。
    b. **プロンプト構築**: 1 ルール ファイル + 該当ファイルの diff/全文 + suppressions で構成します。
    c. **`claude -p` 実行**: `CLAUDECODE` 環境変数を除去してネストセッション検出を回避しつつ実行します。
    d. **キャッシュ保存**: ルール単位でキャッシュします。
-7. **結果集約**: 全ルールの結果をルール ファイル名でソートして集約します。deny が 1 つでもあれば全体 deny になります。
+8. **結果集約**: 全ルールの結果をルール ファイル名でソートして集約します。deny が 1 つでもあれば全体 deny になります。
+
+**処理フロー (ストリーム)**
+
+1. **stream-id 生成**: `YYYYMMDD-HHMMSS-<random6>` 形式の ID を生成します。
+2. **結果ディレクトリ作成**: `.complete-validator/stream-results/<stream-id>/` を作成します。
+3. **ワーカー起動**: `subprocess.Popen` で子プロセス (`--stream-worker`) を起動します (`start_new_session=True`)。
+4. **即 exit**: stream-id を stdout に出力して親プロセスは即 exit 0 します。
+5. **ワーカー処理**: (rule_file, individual_file) ペアを列挙し、`ThreadPoolExecutor` で並列実行します。
+6. **結果出力**: 完了するたびに per-file 結果ファイルと `status.json` を更新します。
 
 設計上の重要な判断です。
 
-- **ルール ファイル単位の分割実行**: 各 `claude -p` のプロンプトが小さくなり、検出精度が向上します。
-- **並列実行**: ルール ファイル数分のワーカーで並列実行し、全体の実行時間を短縮します。
+- **ルール ファイルの再帰探索**: `rglob("*.md")` でサブディレクトリ内のルール ファイルも読み込みます。ルールの物理分割により 1 回の `claude -p` のプロンプトが小さくなり、検出精度が向上します。
+- **並列実行**: ルール ファイル数分のワーカーで並列実行し、全体の実行時間を短縮します。ストリーム モードでは最大 16 ワーカーです。
 - **部分キャッシュ**: ルール ファイル単位でキャッシュするため、1 つのルールだけ変更した場合でも他はキャッシュ ヒットします。
+- **per-file キャッシュ**: ストリーム モードは per-file 粒度のキャッシュを使用します。hook 実行時に preflight で参照され、高速パスを実現します。
 - **違反ありの場合は `"permissionDecision": "deny"`**: commit をブロックします。エージェントが違反を修正してから再 commit します。
 - **偽陽性対策**: `.complete-validator/suppressions.md` に記述することで、既知の偽陽性を抑制できます。
 - **エラー時は allow**: `claude -p` のタイムアウト (580 秒) や失敗時は警告メッセージ付きで allow します。
@@ -237,9 +303,11 @@ applies_to: ["*.py", "*.md"]
 ## キャッシュ
 
 - git toplevel の `$GIT_TOPLEVEL/.complete-validator/cache.json` に保存されます。
-- キーは `sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)` で、ルール ファイル単位です。
+- **per-rule キャッシュ** (hook/オンデマンド): キーは `sha256(prompt_version + "per-rule" + rule_name + rule_body + 該当ファイルの diff + suppressions)` です。
+- **per-file キャッシュ** (ストリーム): キーは `sha256(prompt_version + "per-file" + rule_name + file_path + rule_body + diff + suppressions)` です。per-rule キャッシュとは別空間です。
 - diff、ルール、または suppressions が変わると自動的にキャッシュ ミスになります。
 - 1 つのルールだけ変更した場合、他のルールは部分キャッシュによりキャッシュ ヒットして高速化します。
+- ストリーム モードで蓄積された per-file キャッシュは、hook 実行時の preflight で参照され、高速パスを実現します。
 - キャッシュ クリアは `rm -f .complete-validator/cache.json` です。
 - `.gitignore` により Git 管理外です。
 
@@ -291,6 +359,26 @@ python3 scripts/check_style.py --staged
 
 # plugin-dir を明示指定 (組み込みルールの場所)
 python3 scripts/check_style.py --plugin-dir /path/to/complete-validator
+```
+
+### ストリーム モード
+
+```bash
+# ストリーム チェックを開始 (working モード)
+python3 scripts/check_style.py --stream --plugin-dir /path/to/complete-validator
+# → stream-id が stdout に出力されます。
+
+# ストリーム チェックを開始 (staged モード)
+python3 scripts/check_style.py --stream --staged --plugin-dir /path/to/complete-validator
+
+# 進捗確認
+cat .complete-validator/stream-results/<stream-id>/status.json
+
+# 個別結果確認
+cat .complete-validator/stream-results/<stream-id>/results/*.json
+
+# ワーカー ログ確認
+cat .complete-validator/stream-results/<stream-id>/worker.log
 ```
 
 ### キャッシュ クリア

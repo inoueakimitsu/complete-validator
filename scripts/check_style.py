@@ -2,10 +2,11 @@
 """AI validator using Claude.
 
 Validates files against rules defined in rules/*.md.
-Supports three modes:
+Supports four modes:
   - working (default): validates unstaged changes (for on-demand use)
   - staged (--staged):  validates staged changes (for commit hooks)
   - full-scan (--full-scan): validates all tracked files (for scanning existing code)
+  - stream (--stream):  background per-file validation with polling results
 
 Runs claude -p per rule file in parallel for better detection accuracy.
 Violations are denied (commit blocked) so the agent must fix them.
@@ -16,7 +17,9 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
+import string
 import subprocess
 import sys
 import threading
@@ -41,6 +44,10 @@ FULL_SCAN_DEADLINE_SECONDS = 3600
 HOOK_DEADLINE_SECONDS = 590
 # deadline 超過後でもキャッシュ ヒット済み Future を回収するための最低待機時間です。
 MIN_FUTURE_TIMEOUT_SECONDS = 10
+# ストリーム モードの結果ディレクトリを保持する最大数です。
+MAX_STREAM_RESULTS_DIRS = 5
+# ストリーム モードの deadline (秒) です。hook 外で実行するため長めに設定しています。
+STREAM_DEADLINE_SECONDS = 3600
 
 
 @dataclass
@@ -101,6 +108,151 @@ class CacheStore:
                 json.dumps(self._data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+
+
+@dataclass
+class StreamStatusTracker:
+    """Tracks stream mode progress and writes status.json.
+
+    Parameters
+    ----------
+    results_dir: Path
+        ストリーム結果ディレクトリのパスです。
+    total_units: int
+        チェック対象のユニット (ルール × ファイル ペア) の総数です。
+    """
+
+    results_dir: Path
+    total_units: int
+    _completed: int = 0
+    _summary: dict = field(default_factory=lambda: {"allow": 0, "deny": 0, "error": 0, "pending": 0})
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _started_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+
+    def __post_init__(self) -> None:
+        """Initialize pending count and write initial status."""
+        self._summary["pending"] = self.total_units
+        self._write_status("running")
+
+    def update(self, status: str) -> None:
+        """Record completion of one unit and update status.json.
+
+        Parameters
+        ----------
+        status: str
+            ユニットの結果 (``"allow"``、``"deny"``、``"error"``) です。
+        """
+        with self._lock:
+            self._completed += 1
+            self._summary[status] = self._summary.get(status, 0) + 1
+            self._summary["pending"] = self.total_units - self._completed
+            overall = "completed" if self._completed >= self.total_units else "running"
+            self._write_status(overall)
+
+    def mark_completed(self) -> None:
+        """Mark the stream as completed."""
+        self._write_status("completed")
+
+    def _write_status(self, overall_status: str) -> None:
+        """Write status.json to the results directory.
+
+        Parameters
+        ----------
+        overall_status: str
+            全体のステータス (``"running"``、``"completed"``) です。
+        """
+        status_data = {
+            "stream_id": self.results_dir.name,
+            "total_units": self.total_units,
+            "completed_units": self._completed,
+            "status": overall_status,
+            "started_at": self._started_at,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "summary": dict(self._summary),
+        }
+        status_path = self.results_dir / "status.json"
+        status_path.write_text(
+            json.dumps(status_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def generate_stream_id() -> str:
+    """Generate a unique stream ID (timestamp + random suffix).
+
+    Returns
+    -------
+    str
+        ``YYYYMMDD-HHMMSS-<random6>`` 形式の ID です。
+    """
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"{timestamp}-{suffix}"
+
+
+def cleanup_old_stream_results(base_dir: Path) -> None:
+    """Keep only the latest stream result directories.
+
+    Parameters
+    ----------
+    base_dir: Path
+        ``.complete-validator/stream-results/`` ディレクトリのパスです。
+    """
+    if not base_dir.exists():
+        return
+    dirs = sorted(
+        [d for d in base_dir.iterdir() if d.is_dir()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    for old_dir in dirs[MAX_STREAM_RESULTS_DIRS:]:
+        import shutil
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+
+def write_result_file(
+    results_dir: Path,
+    rule_name: str,
+    file_path: str,
+    status: str,
+    message: str,
+    cache_hit: bool,
+) -> None:
+    """Write a single result file for a (rule, file) pair.
+
+    Parameters
+    ----------
+    results_dir: Path
+        ストリーム結果ディレクトリのパスです。
+    rule_name: str
+        ルール名です。
+    file_path: str
+        チェック対象のファイル パスです。
+    status: str
+        結果ステータス (``"allow"``、``"deny"``、``"error"``) です。
+    message: str
+        詳細メッセージです。
+    cache_hit: bool
+        キャッシュ ヒットしたかどうかです。
+    """
+    # ルール名とファイル パスからファイル名を生成します。
+    path_hash = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:12]
+    safe_rule = rule_name.replace("/", "__").replace("\\", "__").replace(".md", "")
+    result_filename = f"{safe_rule}__{path_hash}.json"
+
+    result_data = {
+        "rule_name": rule_name,
+        "file_path": file_path,
+        "status": status,
+        "message": message,
+        "cache_hit": cache_hit,
+    }
+    out_dir = results_dir / "results"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / result_filename).write_text(
+        json.dumps(result_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def run_git(*args: str) -> str:
@@ -251,7 +403,7 @@ def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
 
     rules = []
     warnings = []
-    for md_file in sorted(rules_dir.glob("*.md")):
+    for md_file in sorted(rules_dir.rglob("*.md")):
         file_content = md_file.read_text(encoding="utf-8")
         frontmatter, body = parse_frontmatter(file_content)
 
@@ -265,7 +417,9 @@ def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
         if isinstance(patterns, str):
             patterns = [patterns]
 
-        rules.append((md_file.name, patterns, body))
+        # ディレクトリ相対パスをルール名として使用します (例: readable_code/02_naming.md)。
+        relative_name = str(md_file.relative_to(rules_dir))
+        rules.append((relative_name, patterns, body))
 
     return rules, warnings
 
@@ -401,8 +555,10 @@ def compute_cache_key(
     diff_for_rule: str,
     suppressions: str = "",
     mode: str = "diff",
+    per_file: bool = False,
+    file_path: str = "",
 ) -> str:
-    """Compute SHA256 hash for per-rule caching.
+    """Compute SHA256 hash for caching.
 
     Parameters
     ----------
@@ -415,16 +571,22 @@ def compute_cache_key(
     suppressions: str
         suppressions の内容です。
     mode: str
-        ``"diff"`` または ``"full-scan"`` です。
+        ``"diff"``、``"full-scan"``、``"stream"`` のいずれかです。
+    per_file: bool
+        ``True`` なら per-file 粒度のキャッシュです。ストリーム モード用です。
+    file_path: str
+        per_file が ``True`` の場合のファイル パスです。
 
     Returns
     -------
     str
         SHA256 ハッシュ文字列です。
     """
+    granularity = "per-file" if per_file else "per-rule"
     cache_key_material = (
-        PROMPT_VERSION + ":" + mode
+        PROMPT_VERSION + ":" + mode + ":" + granularity
         + "\n---RULE_NAME---\n" + rule_name
+        + "\n---FILE_PATH---\n" + file_path
         + "\n---RULE_BODY---\n" + rule_body
         + "\n---DIFF---\n" + diff_for_rule
         + "\n---SUPPRESSIONS---\n" + suppressions
@@ -618,6 +780,165 @@ def build_prompt_for_rule(
     return "\n".join(parts)
 
 
+def build_prompt_for_single_file(
+    rule_name: str,
+    rule_body: str,
+    file_path: str,
+    file_content: str,
+    file_diff: str,
+    suppressions: str = "",
+    full_scan: bool = False,
+) -> str:
+    """Build the prompt for checking a single rule against a single file.
+
+    Parameters
+    ----------
+    rule_name: str
+        ルール ファイル名です。
+    rule_body: str
+        ルール本文です。
+    file_path: str
+        チェック対象のファイル パスです。
+    file_content: str
+        ファイルの全文です。
+    file_diff: str
+        ファイルの diff チャンクです。
+    suppressions: str
+        suppressions の内容です。
+    full_scan: bool
+        ``True`` ならフル スキャン モードです。
+
+    Returns
+    -------
+    str
+        構築されたプロンプト文字列です。
+    """
+    headings = extract_rule_headings(rule_body)
+
+    scope_instruction = (
+        "Check the entire file content against the rules. All code in the file is the check target."
+        if full_scan
+        else "The diff is the primary check target. The full file content is provided for context only."
+    )
+    parts = [
+        "You are a strict AI validator. You MUST check every rule listed for the file. Do not skip any rule.",
+        scope_instruction,
+        "If you are uncertain whether something is a violation, report it with a note that it needs confirmation.",
+        "Be specific: state the file, line, and which rule is violated.",
+        "If there are no violations, respond with exactly: 'No violations found.'",
+        "",
+    ]
+
+    if headings:
+        parts.append("## Rules Checklist")
+        parts.append("You must check each of the following rules:")
+        for heading in headings:
+            parts.append(f"- [ ] {heading}")
+        parts.append("")
+
+    parts.append(f"=== RULE: {rule_name} ===")
+    parts.append(rule_body)
+    parts.append("")
+
+    parts.append(f"=== FILE: {file_path} ===")
+    parts.append("")
+
+    if full_scan:
+        parts.append("--- Full Content (primary check target) ---")
+        parts.append(file_content)
+        parts.append("")
+    else:
+        parts.append("--- Changes (primary check target) ---")
+        parts.append(file_diff if file_diff else "(no diff available for this file)")
+        parts.append("")
+        parts.append("--- Full Content (for context) ---")
+        parts.append(file_content)
+        parts.append("")
+
+    if suppressions:
+        parts.append("=== KNOWN SUPPRESSIONS ===")
+        parts.append("以下は既知の例外です。これらに該当する場合は違反として報告しないでください。")
+        parts.append(suppressions)
+        parts.append("")
+
+    parts.append("## Reminder")
+    parts.append("Confirm that you have checked every rule in the checklist above.")
+    parts.append("Do not skip any rule. Report all violations found.")
+
+    return "\n".join(parts)
+
+
+def check_single_rule_single_file(
+    rule_name: str,
+    rule_body: str,
+    file_path: str,
+    file_content: str,
+    file_diff: str,
+    suppressions: str,
+    cache: CacheStore,
+    full_scan: bool = False,
+) -> tuple[str, str, str, str, bool]:
+    """Check a single rule against a single file.
+
+    Parameters
+    ----------
+    rule_name: str
+        ルール ファイル名です。
+    rule_body: str
+        ルール本文です。
+    file_path: str
+        チェック対象のファイル パスです。
+    file_content: str
+        ファイルの全文です。
+    file_diff: str
+        ファイルの diff チャンクです。
+    suppressions: str
+        suppressions の内容です。
+    cache: CacheStore
+        キャッシュ ストアです。
+    full_scan: bool
+        ``True`` ならフル スキャン モードです。
+
+    Returns
+    -------
+    tuple[str, str, str, str, bool]
+        ``(rule_name, file_path, status, message, cache_hit)`` です。
+    """
+    mode = "full-scan" if full_scan else "stream"
+    diff_or_content = file_content if full_scan else file_diff
+    cache_key = compute_cache_key(
+        rule_name, rule_body, diff_or_content, suppressions,
+        mode=mode, per_file=True, file_path=file_path,
+    )
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        is_clean = "[action required]" not in cached.lower()
+        status = "allow" if is_clean else "deny"
+        return rule_name, file_path, status, cached, True
+
+    prompt = build_prompt_for_single_file(
+        rule_name, rule_body, file_path, file_content, file_diff,
+        suppressions, full_scan=full_scan,
+    )
+
+    try:
+        response = run_claude_check(prompt)
+    except subprocess.TimeoutExpired:
+        return rule_name, file_path, "error", f"[{rule_name}:{file_path}] Timed out.", False
+    except Exception as e:
+        return rule_name, file_path, "error", f"[{rule_name}:{file_path}] Error: {e}", False
+
+    is_clean = "no violations found" in response.lower()
+    message = f"[Rule: {rule_name} | File: {file_path}]\n{response}"
+    if not is_clean:
+        message += "\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md."
+
+    cache.put(cache_key, message)
+    status = "allow" if is_clean else "deny"
+    return rule_name, file_path, status, message, False
+
+
 def check_single_rule(
     rule_name: str,
     rule_body: str,
@@ -661,6 +982,29 @@ def check_single_rule(
     matched = [file_path for file_path in matched if file_path in files]
     if not matched:
         return rule_name, "skip", ""
+
+    # Per-file cache preflight: ストリーム モードで蓄積された per-file キャッシュを確認します。
+    # 全マッチ ファイルが per-file キャッシュでヒットすれば、claude -p を実行せず集約して即返却します。
+    if not full_scan:
+        per_file_results: list[tuple[str, str]] = []
+        all_hit = True
+        for fp in matched:
+            pf_diff = diff_chunks.get(fp, "")
+            pf_key = compute_cache_key(
+                rule_name, rule_body, pf_diff, suppressions,
+                mode="stream", per_file=True, file_path=fp,
+            )
+            pf_cached = cache.get(pf_key)
+            if pf_cached is None:
+                all_hit = False
+                break
+            pf_is_clean = "[action required]" not in pf_cached.lower()
+            per_file_results.append(("allow" if pf_is_clean else "deny", pf_cached))
+
+        if all_hit and per_file_results:
+            has_deny = any(s == "deny" for s, _ in per_file_results)
+            aggregated = "\n\n".join(msg for _, msg in per_file_results)
+            return rule_name, "deny" if has_deny else "allow", aggregated
 
     # Build cache key
     if full_scan:
@@ -741,7 +1085,7 @@ def parse_args() -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        パース済みの引数です。``staged``、``full_scan``、``plugin_dir`` を含みます。
+        パース済みの引数です。
     """
     parser = argparse.ArgumentParser(
         description="AI validator using Claude."
@@ -762,6 +1106,23 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Plugin directory containing built-in rules/.",
+    )
+    # ストリーム モード
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Start stream mode: fork a background worker and print stream-id.",
+    )
+    parser.add_argument(
+        "--stream-worker",
+        action="store_true",
+        help="Internal: run as a stream worker process.",
+    )
+    parser.add_argument(
+        "--stream-id",
+        type=str,
+        default=None,
+        help="Internal: stream ID for the worker process.",
     )
     return parser.parse_args()
 
@@ -898,6 +1259,93 @@ def run_parallel_checks(
     return results
 
 
+def run_stream_checks(
+    rules: RuleList,
+    target_files: list[str],
+    files: dict[str, str],
+    diff_chunks: dict[str, str],
+    suppressions: str,
+    cache: CacheStore,
+    results_dir: Path,
+    full_scan: bool = False,
+    log_file: Path | None = None,
+) -> None:
+    """Run per-file rule checks in parallel and write results to disk.
+
+    Parameters
+    ----------
+    rules: RuleList
+        チェックするルールのリストです。
+    target_files: list[str]
+        チェック対象のファイル パスのリストです。
+    files: dict[str, str]
+        ファイル パスをキー、内容を値とする辞書です。
+    diff_chunks: dict[str, str]
+        ファイル パスをキー、diff チャンクを値とする辞書です。
+    suppressions: str
+        suppressions の内容です。
+    cache: CacheStore
+        キャッシュ ストアです。
+    results_dir: Path
+        ストリーム結果ディレクトリのパスです。
+    full_scan: bool
+        ``True`` ならフル スキャン モードです。
+    log_file: Path | None
+        ワーカー ログのパスです。
+    """
+    def log(msg: str) -> None:
+        if log_file:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+
+    # (rule_name, rule_body, file_path) のペアを列挙します。
+    units: list[tuple[str, str, str]] = []
+    for rule_name, rule_patterns, rule_body in rules:
+        matched = files_matching_patterns(rule_patterns, target_files)
+        matched = [fp for fp in matched if fp in files]
+        for fp in matched:
+            units.append((rule_name, rule_body, fp))
+
+    if not units:
+        log("No rule-file units to check.")
+        tracker = StreamStatusTracker(results_dir=results_dir, total_units=0)
+        tracker.mark_completed()
+        return
+
+    tracker = StreamStatusTracker(results_dir=results_dir, total_units=len(units))
+    log(f"Starting {len(units)} units.")
+    deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
+
+    with ThreadPoolExecutor(max_workers=min(len(units), 16)) as executor:
+        futures = {}
+        for rule_name, rule_body, fp in units:
+            future = executor.submit(
+                check_single_rule_single_file,
+                rule_name, rule_body, fp,
+                files[fp], diff_chunks.get(fp, ""),
+                suppressions, cache,
+                full_scan=full_scan,
+            )
+            futures[future] = (rule_name, fp)
+
+        for future in as_completed(futures):
+            remaining = deadline - time.monotonic()
+            timeout = max(MIN_FUTURE_TIMEOUT_SECONDS, remaining)
+            try:
+                r_rule, r_file, r_status, r_message, r_cache_hit = future.result(timeout=timeout)
+                write_result_file(results_dir, r_rule, r_file, r_status, r_message, r_cache_hit)
+                tracker.update(r_status)
+                log(f"[{r_status}] {r_rule} | {r_file} (cache={r_cache_hit})")
+            except Exception as e:
+                failed_rule, failed_file = futures[future]
+                write_result_file(results_dir, failed_rule, failed_file, "error", str(e), False)
+                tracker.update("error")
+                log(f"[error] {failed_rule} | {failed_file}: {e}")
+
+    tracker.mark_completed()
+    log("Stream completed.")
+
+
 def format_and_output(
     results: list[tuple[str, str, str]],
     warnings: list[str],
@@ -957,9 +1405,128 @@ def format_and_output(
             output_result("allow", message)
 
 
+def main_stream(args: argparse.Namespace) -> None:
+    """Start stream mode: fork a background worker and print stream-id.
+
+    Parameters
+    ----------
+    args: argparse.Namespace
+        パース済みの引数です。
+    """
+    stream_id = generate_stream_id()
+    git_toplevel = run_git("rev-parse", "--show-toplevel")
+    cache_dir = Path(git_toplevel) if git_toplevel else Path.cwd()
+    results_base = cache_dir / ".complete-validator" / "stream-results"
+    results_base.mkdir(parents=True, exist_ok=True)
+    results_dir = results_base / stream_id
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    cleanup_old_stream_results(results_base)
+
+    # ワーカー プロセスを起動します。
+    worker_cmd = [
+        sys.executable, __file__,
+        "--stream-worker",
+        "--stream-id", stream_id,
+    ]
+    if args.staged:
+        worker_cmd.append("--staged")
+    if args.full_scan:
+        worker_cmd.append("--full-scan")
+    if args.plugin_dir:
+        worker_cmd.extend(["--plugin-dir", str(args.plugin_dir)])
+
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    log_file = results_dir / "worker.log"
+    with open(log_file, "w", encoding="utf-8") as lf:
+        subprocess.Popen(
+            worker_cmd,
+            stdout=lf,
+            stderr=lf,
+            start_new_session=True,
+            env=env,
+        )
+
+    print(stream_id)
+    sys.exit(0)
+
+
+def main_stream_worker(args: argparse.Namespace) -> None:
+    """Run as a stream worker process (invoked by main_stream).
+
+    Parameters
+    ----------
+    args: argparse.Namespace
+        パース済みの引数です。
+    """
+    staged = args.staged
+    full_scan = args.full_scan
+    stream_id = args.stream_id
+
+    git_toplevel = run_git("rev-parse", "--show-toplevel")
+    cache_dir = Path(git_toplevel) if git_toplevel else Path.cwd()
+    results_dir = cache_dir / ".complete-validator" / "stream-results" / stream_id
+    results_dir.mkdir(parents=True, exist_ok=True)
+    log_file = results_dir / "worker.log"
+
+    target_files, diff_chunks = resolve_target_files(staged, full_scan)
+    if not target_files:
+        tracker = StreamStatusTracker(results_dir=results_dir, total_units=0)
+        tracker.mark_completed()
+        return
+
+    project_dirs = find_project_rules_dirs()
+    builtin_dir = args.plugin_dir / "rules" if args.plugin_dir else None
+    rules, _warnings = merge_rules(builtin_dir, project_dirs)
+    if not rules:
+        tracker = StreamStatusTracker(results_dir=results_dir, total_units=0)
+        tracker.mark_completed()
+        return
+
+    if not any_file_matches_rules(rules, target_files):
+        tracker = StreamStatusTracker(results_dir=results_dir, total_units=0)
+        tracker.mark_completed()
+        return
+
+    suppressions = load_suppressions(cache_dir)
+    cache = CacheStore(path=cache_dir / ".complete-validator" / "cache.json")
+    cache.load()
+
+    matched_target_files = [
+        fp for fp in target_files
+        if any(
+            any(fnmatch(os.path.basename(fp), pat) for pat in patterns)
+            for _name, patterns, _body in rules
+        )
+    ]
+    files = load_file_contents(matched_target_files, staged, full_scan)
+    if not files:
+        tracker = StreamStatusTracker(results_dir=results_dir, total_units=0)
+        tracker.mark_completed()
+        return
+
+    run_stream_checks(
+        rules, target_files, files, diff_chunks,
+        suppressions, cache, results_dir,
+        full_scan=full_scan, log_file=log_file,
+    )
+
+
 def main() -> None:
     """Run the AI validator: parse args, load rules, and check files."""
     args = parse_args()
+
+    # ストリーム モード: バックグラウンド ワーカーを起動して stream-id を出力します。
+    if args.stream:
+        main_stream(args)
+        return
+
+    # ストリーム ワーカー モード: バックグラウンドで per-file チェックを実行します。
+    if args.stream_worker:
+        main_stream_worker(args)
+        return
+
     staged = args.staged
     full_scan = args.full_scan
 
