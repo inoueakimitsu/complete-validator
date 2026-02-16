@@ -14,24 +14,24 @@ staged された変更に対してルールチェックを行い、違反があ�
 
 ### 違反が検出されたとき
 
-1. 違反内容を確認し、修正が必要か偽陽性かを判断する
-2. 明らかな違反 → コードを修正して再 commit
-3. 偽陽性の可能性がある場合 → **必ずユーザーに確認する**。ユーザーに違反内容を提示し、修正すべきか偽陽性として抑制すべきかを質問する
-4. ユーザーが偽陽性と判断した場合 → プロジェクトの `.complete-validator/suppressions.md` に抑制理由を追記し、再 commit する
-5. 全ての違反が解消されるまで繰り返す
+1. 違反内容を確認し、修正が必要か偽陽性かを判断します。
+2. 明らかな違反 → コードを修正して再 commit します。
+3. 偽陽性の可能性がある場合 → **必ずユーザーに確認します**。ユーザーに違反内容を提示し、修正すべきか偽陽性として抑制すべきかを質問します。
+4. ユーザーが偽陽性と判断した場合 → プロジェクトの `.complete-validator/suppressions.md` に抑制理由を追記し、再 commit します。
+5. 全ての違反が解消されるまで繰り返します。
 
-## オンデマンドチェック
+## オンデマンド チェック
 
 commit 前に任意のタイミングでバリデーションを実行できます。
 
 ```bash
-# working (unstaged) な変更をチェック（デフォルト）
+# working (unstaged) な変更をチェック (デフォルト)
 python3 scripts/check_style.py
 
 # staged な変更をチェック
 python3 scripts/check_style.py --staged
 
-# プラグインディレクトリを明示指定 (組み込みルールの場所)
+# プラグイン ディレクトリを明示指定 (組み込みルールの場所)
 python3 scripts/check_style.py --plugin-dir /path/to/complete-validator
 ```
 
@@ -52,7 +52,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${
 
 プロジェクトの `.complete-validator/suppressions.md` に記述すると、該当する検出が抑制されます。
 
-ユーザーが偽陽性と判断した場合、以下の形式で追記してください:
+ユーザーが偽陽性と判断した場合、以下の形式で追記してください。
 
 ```markdown
 - `<ルールファイル名>` の <ルール名>: <抑制理由の説明>
@@ -68,6 +68,6 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${
 
 ### プロジェクト固有ルール
 
-プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加してください。そのプロジェクトのみに適用されます。組み込みルールと同名のファイルを置くと、プロジェクト側が優先されます (nearest wins)。
+プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加してください。そのプロジェクトのみに適用されます。組み込みルールと同名のファイルを置くと、nearest wins でプロジェクト側が優先されます。
 
 いずれの場合も `## ` 見出しでルールを区切り、Bad/Good の具体例を記載します。

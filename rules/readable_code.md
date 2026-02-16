@@ -1028,7 +1028,7 @@ root_message.last_view_time = datetime.datetime.now()
 
 ## 制御フロー変数を避ける
 
-プログラムの実行を制御するためだけの変数（例：done フラグ）は削除する。break や return を使用することで、同じ目的を達成できる。
+プログラムの実行を制御するためだけの変数 (例: done フラグ) は削除する。break や return を使用することで、同じ目的を達成できる。
 
 **Bad:**
 ```cpp

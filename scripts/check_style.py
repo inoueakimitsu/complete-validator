@@ -27,21 +27,19 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 
-# v3: ルールファイル単位の分割並列実行に変更 (v2 は全ルール一括、v1 はファイル単位)
+# v3: ルール ファイル単位の分割並列実行に変更しています (v2 は全ルール一括、v1 はファイル単位)。
 PROMPT_VERSION = "3"
 
-# (rule_filename, glob_patterns, body) のリスト
+# (rule_filename, glob_patterns, body) のリストです。
 RuleList = list[tuple[str, list[str], str]]
 
-# claude -p の応答待ち上限。ルール 1 つあたりの処理時間に余裕を持たせた値
+# claude -p の応答待ち上限です。ルール 1 つあたりの処理時間に余裕を持たせた値です。
 CLAUDE_TIMEOUT_SECONDS = 580
-# Claude CLI 側のタイムアウト (ミリ秒)。CLAUDE_TIMEOUT_SECONDS より長く設定し、Python 側で先に打ち切る
-CLAUDE_CLI_TIMEOUT_MS = 600000
-# フルスキャンは hook 外で実行するため、ルール数×ファイル数に応じて十分長く設定
+# フル スキャンは hook 外で実行するため、ルール数 × ファイル数に応じて十分長く設定しています。
 FULL_SCAN_DEADLINE_SECONDS = 3600
-# hook タイムアウト (600秒) の 10 秒前に打ち切り、結果出力の時間を確保する
+# hook タイムアウト (600 秒) の 10 秒前に打ち切り、結果出力の時間を確保します。
 HOOK_DEADLINE_SECONDS = 590
-# deadline 超過後でもキャッシュヒット済み Future を回収するための最低待機時間
+# deadline 超過後でもキャッシュ ヒット済み Future を回収するための最低待機時間です。
 MIN_FUTURE_TIMEOUT_SECONDS = 10
 
 
@@ -76,7 +74,7 @@ class CacheStore:
         Parameters
         ----------
         key: str
-            キャッシュキー (SHA256 ハッシュ) です。
+            キャッシュ キー (SHA256 ハッシュ) です。
 
         Returns
         -------
@@ -92,7 +90,7 @@ class CacheStore:
         Parameters
         ----------
         key: str
-            キャッシュキー (SHA256 ハッシュ) です。
+            キャッシュ キー (SHA256 ハッシュ) です。
         value: str
             キャッシュする値 (バリデーション結果) です。
         """
@@ -155,7 +153,7 @@ def get_changed_files(staged: bool) -> list[str]:
     Returns
     -------
     list[str]
-        変更されたファイルパスのリストです。
+        変更されたファイル パスのリストです。
     """
     args = ["diff", "--name-only", "--diff-filter=d"]
     if staged:
@@ -170,7 +168,7 @@ def get_all_tracked_files() -> list[str]:
     Returns
     -------
     list[str]
-        tracked ファイルパスのリストです。
+        tracked ファイル パスのリストです。
     """
     output = run_git("ls-files")
     return output.splitlines() if output else []
@@ -182,7 +180,7 @@ def get_file_content(file_path: str, staged: bool) -> str:
     Parameters
     ----------
     file_path: str
-        ファイルパスです。
+        ファイル パスです。
     staged: bool
         ``True`` なら ``git show :<path>`` で staged 版を取得します。
 
@@ -202,12 +200,12 @@ def parse_frontmatter(content: str) -> tuple[dict | None, str]:
     Parameters
     ----------
     content: str
-        ルールファイルの全文です。
+        ルール ファイルの全文です。
 
     Returns
     -------
     tuple[dict | None, str]
-        ``(frontmatter_dict, body)``。フロントマターがなければ ``(None, content)``。
+        ``(frontmatter_dict, body)``。フロント マターがなければ ``(None, content)``。
     """
     match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
     if not match:
@@ -240,7 +238,7 @@ def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
     Parameters
     ----------
     rules_dir: Path
-        ルールファイルを含むディレクトリです。
+        ルール ファイルを含むディレクトリです。
 
     Returns
     -------
@@ -259,7 +257,7 @@ def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
 
         if frontmatter is None or "applies_to" not in frontmatter:
             warnings.append(
-                f"ルールファイル {md_file.name} に `applies_to` フロントマターがありません。追記してください。"
+                f"ルール ファイル {md_file.name} に `applies_to` フロント マターがありません。追記してください。"
             )
             continue
 
@@ -302,7 +300,7 @@ def merge_rules(
     Parameters
     ----------
     builtin_dir: Path | None
-        プラグイン組み込み ``rules/`` ディレクトリです。``None`` なら組み込みルールなし。
+        プラグイン組み込み ``rules/`` ディレクトリです。``None`` なら組み込みルールはありません。
     project_dirs: list[Path]
         プロジェクト側の ``rules/`` ディレクトリ (近い順) です。
 
@@ -337,12 +335,12 @@ def files_matching_patterns(
     patterns: list[str]
         glob パターンのリストです (例: ``["*.py", "*.md"]``)。
     file_paths: list[str]
-        マッチ対象のファイルパスのリストです。
+        マッチ対象のファイル パスのリストです。
 
     Returns
     -------
     list[str]
-        パターンに一致したファイルパスのリストです。
+        パターンに一致したファイル パスのリストです。
     """
     matched = []
     for file_path in file_paths:
@@ -360,7 +358,7 @@ def any_file_matches_rules(rules: RuleList, file_paths: list[str]) -> bool:
     rules: RuleList
         ルールのリストです。
     file_paths: list[str]
-        マッチ対象のファイルパスのリストです。
+        マッチ対象のファイル パスのリストです。
 
     Returns
     -------
@@ -409,7 +407,7 @@ def compute_cache_key(
     Parameters
     ----------
     rule_name: str
-        ルールファイル名です。
+        ルール ファイル名です。
     rule_body: str
         ルール本文です。
     diff_for_rule: str
@@ -450,7 +448,7 @@ def run_claude_check(prompt: str) -> str:
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     result = subprocess.run(
-        ["claude", "-p", "--timeout", str(CLAUDE_CLI_TIMEOUT_MS)],
+        ["claude", "-p"],
         input=prompt,
         capture_output=True,
         text=True,
@@ -473,7 +471,7 @@ def split_diff_by_file(diff: str) -> dict[str, str]:
     Returns
     -------
     dict[str, str]
-        ファイルパスをキー、そのファイルの diff チャンクを値とする辞書です。
+        ファイル パスをキー、そのファイルの diff チャンクを値とする辞書です。
     """
     chunks: dict[str, str] = {}
     current_path: str | None = None
@@ -502,12 +500,12 @@ def extract_rule_headings(rule_body: str) -> list[str]:
     Parameters
     ----------
     rule_body: str
-        ルールファイルの本文 (フロントマター除去済み) です。
+        ルール ファイルの本文 (フロント マター除去済み) です。
 
     Returns
     -------
     list[str]
-        見出しテキストのリストです。コードブロック内の見出しはスキップします。
+        見出しテキストのリストです。コード ブロック内の見出しはスキップします。
     """
     headings = []
     in_code_block = False
@@ -535,19 +533,19 @@ def build_prompt_for_rule(
     Parameters
     ----------
     rule_name: str
-        ルールファイル名です。
+        ルール ファイル名です。
     rule_body: str
         ルール本文です。
     matched_files: list[str]
-        このルールに一致するファイルパスのリストです。
+        このルールに一致するファイル パスのリストです。
     files: dict[str, str]
-        ファイルパスをキー、ファイル内容を値とする辞書です。
+        ファイル パスをキー、ファイル内容を値とする辞書です。
     diff_chunks: dict[str, str]
-        ファイルパスをキー、diff チャンクを値とする辞書です。
+        ファイル パスをキー、diff チャンクを値とする辞書です。
     suppressions: str
         suppressions の内容です。
     full_scan: bool
-        ``True`` ならフルスキャンモードです。
+        ``True`` ならフル スキャン モードです。
 
     Returns
     -------
@@ -636,23 +634,23 @@ def check_single_rule(
     Parameters
     ----------
     rule_name: str
-        ルールファイル名です。
+        ルール ファイル名です。
     rule_body: str
         ルール本文です。
     rule_patterns: list[str]
         ``applies_to`` glob パターンのリストです。
     changed_files: list[str]
-        チェック対象のファイルパスのリストです。
+        チェック対象のファイル パスのリストです。
     files: dict[str, str]
-        ファイルパスをキー、ファイル内容を値とする辞書です。
+        ファイル パスをキー、ファイル内容を値とする辞書です。
     diff_chunks: dict[str, str]
-        ファイルパスをキー、diff チャンクを値とする辞書です。
+        ファイル パスをキー、diff チャンクを値とする辞書です。
     suppressions: str
         suppressions の内容です。
     cache: CacheStore
-        キャッシュストアです。
+        キャッシュ ストアです。
     full_scan: bool
-        ``True`` ならフルスキャンモードです。
+        ``True`` ならフル スキャン モードです。
 
     Returns
     -------
@@ -779,12 +777,12 @@ def resolve_target_files(
     staged: bool
         staged モードかどうかです。
     full_scan: bool
-        フルスキャンモードかどうかです。
+        フル スキャン モードかどうかです。
 
     Returns
     -------
     tuple[list[str], dict[str, str]]
-        ``(target_files, diff_chunks)``。フルスキャン時は diff_chunks は空辞書です。
+        ``(target_files, diff_chunks)``。フル スキャン時は diff_chunks は空辞書です。
         ファイルがない場合はどちらも空です。
     """
     if full_scan:
@@ -812,7 +810,7 @@ def load_file_contents(
     Parameters
     ----------
     file_paths: list[str]
-        読み込むファイルパスのリストです。
+        読み込むファイル パスのリストです。
     staged: bool
         ``True`` なら staged 版を取得します。
     full_scan: bool
@@ -821,7 +819,7 @@ def load_file_contents(
     Returns
     -------
     dict[str, str]
-        ファイルパスをキー、内容を値とする辞書です。読み込めなかったファイルは除外されます。
+        ファイル パスをキー、内容を値とする辞書です。読み込めなかったファイルは除外されます。
     """
     contents: dict[str, str] = {}
     for file_path in file_paths:
@@ -853,17 +851,17 @@ def run_parallel_checks(
     rules: RuleList
         チェックするルールのリストです。
     target_files: list[str]
-        チェック対象のファイルパスのリストです。
+        チェック対象のファイル パスのリストです。
     files: dict[str, str]
-        ファイルパスをキー、内容を値とする辞書です。
+        ファイル パスをキー、内容を値とする辞書です。
     diff_chunks: dict[str, str]
-        ファイルパスをキー、diff チャンクを値とする辞書です。
+        ファイル パスをキー、diff チャンクを値とする辞書です。
     suppressions: str
         suppressions の内容です。
     cache: CacheStore
-        キャッシュストアです。
+        キャッシュ ストアです。
     full_scan: bool
-        ``True`` ならフルスキャンモードです。
+        ``True`` ならフル スキャン モードです。
 
     Returns
     -------
@@ -895,7 +893,7 @@ def run_parallel_checks(
                 failed_rule_name = futures[future]
                 results.append((failed_rule_name, "error", f"[{failed_rule_name}] Error: {e}"))
 
-    # ルール名順でソートし、実行ごとの出力を安定させる
+    # ルール名順でソートし、実行ごとの出力を安定させます。
     results.sort(key=lambda r: r[0])
     return results
 
@@ -998,7 +996,7 @@ def main() -> None:
     cache = CacheStore(path=cache_dir / ".complete-validator" / "cache.json")
     cache.load()
 
-    # いずれかのルールにマッチするファイルだけ内容を読み込む
+    # いずれかのルールにマッチするファイルだけ内容を読み込みます。
     matched_target_files = [
         file_path for file_path in target_files
         if any(
