@@ -19,6 +19,7 @@ import json
 import os
 import random
 import re
+import shutil
 import string
 import subprocess
 import sys
@@ -206,7 +207,6 @@ def cleanup_old_stream_results(base_dir: Path) -> None:
         reverse=True,
     )
     for old_dir in dirs[MAX_STREAM_RESULTS_DIRS:]:
-        import shutil
         shutil.rmtree(old_dir, ignore_errors=True)
 
 
