@@ -192,6 +192,7 @@ python3 scripts/check_style.py --staged            # staged モード
 python3 scripts/check_style.py --full-scan         # フル スキャン モード
 python3 scripts/check_style.py --stream            # ストリーム モード
 python3 scripts/check_style.py --stream --staged   # ストリーム モード (staged)
+python3 scripts/check_style.py --full-scan --stream # ストリーム モード (フル スキャン)
 python3 scripts/check_style.py --plugin-dir DIR    # プラグイン ディレクトリを指定 (組み込みルールの場所)
 ```
 
@@ -388,6 +389,9 @@ python3 scripts/check_style.py --stream --plugin-dir /path/to/complete-validator
 
 # ストリーム チェックを開始 (staged モード)
 python3 scripts/check_style.py --stream --staged --plugin-dir /path/to/complete-validator
+
+# ストリーム チェックを開始 (フル スキャン)
+python3 scripts/check_style.py --full-scan --stream --plugin-dir /path/to/complete-validator
 
 # 進捗確認
 cat .complete-validator/stream-results/<stream-id>/status.json

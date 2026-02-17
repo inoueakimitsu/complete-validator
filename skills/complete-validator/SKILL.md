@@ -48,6 +48,8 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${
 - 違反がない場合は exit code 0 を返します。
 - 結果はキャッシュされ、ファイル内容が変わらなければ再実行時にキャッシュ ヒットします。
 
+**注意:** フル スキャンではルール数 × 全 tracked ファイル数のユニットが生成されるため、`claude -p` の呼び出し回数が非常に多くなります (例: 13 ルール × 31 ファイル = 403 ユニット)。フォアグラウンド実行では完了まで 10 分以上かかる場合があるため、`--full-scan --stream` でのストリーム モード実行を推奨します。ストリーム モードであればバックグラウンドで実行され、ポーリングで進捗を確認しながら逐次修正できます。
+
 ## ストリーム モード
 
 バックグラウンドで per-file のバリデーションを実行し、結果をポーリングしながら逐次修正できるモードです。ルール数やファイル数が多い場合に、hook の 600 秒タイムアウトを回避しつつ効率的にチェックできます。
@@ -62,6 +64,9 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --stream --plugin-dir ${CLA
 
 # staged な変更をストリーム チェック
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --stream --staged --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+
+# 全 tracked ファイルをストリーム チェック (フル スキャン)
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --stream --plugin-dir ${CLAUDE_PLUGIN_ROOT}
 ```
 
 stream-id が stdout に出力されます。バックグラウンドでワーカーが起動し、ルール × ファイルの各ペアを並列チェックします。
