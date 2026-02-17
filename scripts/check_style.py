@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""AI validator using Claude.
+"""Claude を使用した AI バリデーターです。
 
-Validates files against rules defined in rules/*.md.
-Supports four modes:
-  - working (default): validates unstaged changes (for on-demand use)
-  - staged (--staged):  validates staged changes (for commit hooks)
-  - full-scan (--full-scan): validates all tracked files (for scanning existing code)
-  - stream (--stream):  background per-file validation with polling results
+rules/*.md に定義されたルールに基づいてファイルを検証します。
+4 つのモードをサポートしています:
+  - working (デフォルト): unstaged な変更を検証します (オンデマンド用)
+  - staged (--staged): staged な変更を検証します (commit hook 用)
+  - full-scan (--full-scan): 全 tracked ファイルを検証します (既存コードのスキャン用)
+  - stream (--stream): バックグラウンドで per-file 検証を実行し、結果をポーリングします
 
-Runs claude -p per (rule file, target file) pair in parallel for better detection accuracy.
-Violations are denied (commit blocked) so the agent must fix them.
-False positives can be suppressed via .complete-validator/suppressions.md.
+検出精度向上のため、(ルール ファイル, 対象ファイル) ペアごとに claude -p を並列実行します。
+違反があれば deny (commit ブロック) し、エージェントが修正する必要があります。
+偽陽性は .complete-validator/suppressions.md で抑制できます。
 """
 
 import argparse
@@ -56,7 +56,7 @@ DEFAULT_MAX_WORKERS = 4
 
 
 def load_config(config_dir: Path) -> dict:
-    """Load configuration from .complete-validator/config.json.
+    """.complete-validator/config.json から設定を読み込みます。
 
     Parameters
     ----------
@@ -78,7 +78,7 @@ def load_config(config_dir: Path) -> dict:
 
 
 def get_max_workers(config: dict) -> int:
-    """Get max_workers from config, falling back to DEFAULT_MAX_WORKERS.
+    """config から max_workers を取得します。未設定時は DEFAULT_MAX_WORKERS を返します。
 
     Parameters
     ----------
@@ -98,7 +98,7 @@ def get_max_workers(config: dict) -> int:
 
 @dataclass
 class CacheStore:
-    """Per-rule cache backed by a JSON file on disk.
+    """JSON ファイルに永続化されるキャッシュ ストアです。
 
     Parameters
     ----------
@@ -111,9 +111,9 @@ class CacheStore:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def load(self) -> None:
-        """Load cache contents from disk into memory.
+        """ディスクからキャッシュ内容をメモリーに読み込みます。
 
-        Silently starts with an empty cache if the file is missing or corrupt.
+        ファイルが存在しないか破損している場合は空のキャッシュで開始します。
         """
         if self.path.exists():
             try:
@@ -122,7 +122,7 @@ class CacheStore:
                 self._data = {}
 
     def get(self, key: str) -> str | None:
-        """Return the cached value for *key*, or ``None`` on miss.
+        """*key* に対応するキャッシュ値を返します。ミス時は ``None`` を返します。
 
         Parameters
         ----------
@@ -138,7 +138,7 @@ class CacheStore:
             return self._data.get(key)
 
     def put(self, key: str, value: str) -> None:
-        """Store *value* under *key* and persist to disk.
+        """*key* に *value* を格納し、ディスクに永続化します。
 
         Parameters
         ----------
@@ -158,7 +158,7 @@ class CacheStore:
 
 @dataclass
 class StreamStatusTracker:
-    """Tracks stream mode progress and writes status.json.
+    """ストリーム モードの進捗を追跡し、status.json に書き出します。
 
     Parameters
     ----------
@@ -176,12 +176,12 @@ class StreamStatusTracker:
     _started_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%S%z"))
 
     def __post_init__(self) -> None:
-        """Initialize pending count and write initial status."""
+        """pending カウントを初期化し、初期ステータスを書き出します。"""
         self._summary["pending"] = self.total_units
         self._write_status("running")
 
     def update(self, status: str) -> None:
-        """Record completion of one unit and update status.json.
+        """1 ユニットの完了を記録し、status.json を更新します。
 
         Parameters
         ----------
@@ -196,11 +196,11 @@ class StreamStatusTracker:
             self._write_status(overall)
 
     def mark_completed(self) -> None:
-        """Mark the stream as completed."""
+        """ストリームを完了状態にします。"""
         self._write_status("completed")
 
     def _write_status(self, overall_status: str) -> None:
-        """Write status.json to the results directory.
+        """結果ディレクトリに status.json を書き出します。
 
         Parameters
         ----------
@@ -224,7 +224,7 @@ class StreamStatusTracker:
 
 
 def generate_stream_id() -> str:
-    """Generate a unique stream ID (timestamp + random suffix).
+    """一意のストリーム ID (タイムスタンプ + ランダム サフィックス) を生成します。
 
     Returns
     -------
@@ -237,7 +237,7 @@ def generate_stream_id() -> str:
 
 
 def cleanup_old_stream_results(base_dir: Path) -> None:
-    """Keep only the latest stream result directories.
+    """最新のストリーム結果ディレクトリのみを保持します。
 
     Parameters
     ----------
@@ -263,7 +263,7 @@ def write_result_file(
     message: str,
     cache_hit: bool,
 ) -> None:
-    """Write a single result file for a (rule, file) pair.
+    """(ルール, ファイル) ペアの結果ファイルを 1 つ書き出します。
 
     Parameters
     ----------
@@ -301,7 +301,7 @@ def write_result_file(
 
 
 def run_git(*args: str) -> str:
-    """Run a git command and return stripped stdout.
+    """git コマンドを実行し、前後の空白を除去した stdout を返します。
 
     Parameters
     ----------
@@ -322,7 +322,7 @@ def run_git(*args: str) -> str:
 
 
 def get_diff(staged: bool) -> str:
-    """Get the unified diff (staged or working).
+    """unified diff を取得します (staged または working)。
 
     Parameters
     ----------
@@ -340,7 +340,7 @@ def get_diff(staged: bool) -> str:
 
 
 def get_changed_files(staged: bool) -> list[str]:
-    """Get list of changed file paths (excluding deleted files).
+    """変更されたファイル パスのリストを取得します (削除されたファイルを除く)。
 
     Parameters
     ----------
@@ -360,7 +360,7 @@ def get_changed_files(staged: bool) -> list[str]:
 
 
 def get_all_tracked_files() -> list[str]:
-    """Get all tracked file paths via ``git ls-files``.
+    """``git ls-files`` で全 tracked ファイル パスを取得します。
 
     Returns
     -------
@@ -372,7 +372,7 @@ def get_all_tracked_files() -> list[str]:
 
 
 def get_file_content(file_path: str, staged: bool) -> str:
-    """Get file content (staged version or working copy).
+    """ファイルの内容を取得します (staged 版またはワーキング コピー)。
 
     Parameters
     ----------
@@ -392,7 +392,7 @@ def get_file_content(file_path: str, staged: bool) -> str:
 
 
 def parse_frontmatter(content: str) -> tuple[dict | None, str]:
-    """Parse YAML frontmatter from rule file content.
+    """ルール ファイルの内容から YAML フロント マターをパースします。
 
     Parameters
     ----------
@@ -430,7 +430,7 @@ def parse_frontmatter(content: str) -> tuple[dict | None, str]:
 
 
 def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
-    """Load rule files with their target patterns from a single directory.
+    """単一ディレクトリからルール ファイルとその対象パターンを読み込みます。
 
     Parameters
     ----------
@@ -440,8 +440,8 @@ def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
     Returns
     -------
     tuple[RuleList, list[str]]
-        (rules, warnings) where rules is a list of (filename, patterns, body)
-        and warnings is a list of warning messages for files without frontmatter.
+        (rules, warnings)。rules は (filename, patterns, body) のリスト、
+        warnings はフロント マターのないファイルの警告メッセージ リストです。
     """
     if not rules_dir.exists():
         return [], []
@@ -527,7 +527,7 @@ def files_matching_patterns(
     patterns: list[str],
     file_paths: list[str],
 ) -> list[str]:
-    """Return file paths whose basename matches any of the glob patterns.
+    """basename がいずれかの glob パターンに一致するファイル パスを返します。
 
     Parameters
     ----------
@@ -550,7 +550,7 @@ def files_matching_patterns(
 
 
 def any_file_matches_rules(rules: RuleList, file_paths: list[str]) -> bool:
-    """Return whether any file matches at least one rule's applies_to patterns.
+    """いずれかのファイルがルールの applies_to パターンに一致するかを返します。
 
     Parameters
     ----------
@@ -573,7 +573,7 @@ def any_file_matches_rules(rules: RuleList, file_paths: list[str]) -> bool:
 
 
 def load_suppressions(base_dir: Path) -> str:
-    """Load suppressions from .complete-validator/suppressions.md.
+    """.complete-validator/suppressions.md から suppressions を読み込みます。
 
     Parameters
     ----------
@@ -603,7 +603,7 @@ def compute_cache_key(
     per_file: bool = False,
     file_path: str = "",
 ) -> str:
-    """Compute SHA256 hash for caching.
+    """キャッシュ用の SHA256 ハッシュを計算します。
 
     Parameters
     ----------
@@ -640,7 +640,7 @@ def compute_cache_key(
 
 
 def run_claude_check(prompt: str) -> str:
-    """Run ``claude -p`` with the given prompt and return the response.
+    """指定されたプロンプトで ``claude -p`` を実行し、応答を返します。
 
     Parameters
     ----------
@@ -668,7 +668,7 @@ def run_claude_check(prompt: str) -> str:
 
 
 def split_diff_by_file(diff: str) -> dict[str, str]:
-    """Split a unified diff into per-file chunks.
+    """unified diff をファイルごとのチャンクに分割します。
 
     Parameters
     ----------
@@ -688,7 +688,7 @@ def split_diff_by_file(diff: str) -> dict[str, str]:
         if line.startswith("diff --git "):
             if current_path is not None:
                 chunks[current_path] = "".join(current_lines)
-            # Extract b/ path: 'diff --git a/foo b/bar' -> 'bar'
+            # b/ パスを抽出します: 'diff --git a/foo b/bar' -> 'bar'
             header_parts = line.strip().split(" b/", 1)
             current_path = header_parts[1] if len(header_parts) == 2 else None
             current_lines = [line]
@@ -702,7 +702,7 @@ def split_diff_by_file(diff: str) -> dict[str, str]:
 
 
 def extract_rule_headings(rule_body: str) -> list[str]:
-    """Extract ``##`` headings from a rule body for the checklist.
+    """チェックリスト用にルール本文から ``##`` 見出しを抽出します。
 
     Parameters
     ----------
@@ -735,7 +735,7 @@ def build_prompt_for_single_file(
     suppressions: str = "",
     full_scan: bool = False,
 ) -> str:
-    """Build the prompt for checking a single rule against a single file.
+    """1 つのルールを 1 つのファイルに対してチェックするためのプロンプトを構築します。
 
     Parameters
     ----------
@@ -824,7 +824,7 @@ def check_single_rule_single_file(
     cache: CacheStore,
     full_scan: bool = False,
 ) -> tuple[str, str, str, str, bool]:
-    """Check a single rule against a single file.
+    """1 つのルールを 1 つのファイルに対してチェックします。
 
     Parameters
     ----------
@@ -886,7 +886,7 @@ def check_single_rule_single_file(
 
 
 def output_result(decision: str, message: str = "") -> None:
-    """Output hook result as JSON to stdout.
+    """hook の結果を JSON として stdout に出力します。
 
     Parameters
     ----------
@@ -905,7 +905,7 @@ def output_result(decision: str, message: str = "") -> None:
 
 
 def emit_warnings(warnings: list[str], full_scan: bool) -> None:
-    """Output rule-loading warnings in the appropriate format.
+    """ルール読み込み時の警告を適切な形式で出力します。
 
     Parameters
     ----------
@@ -922,7 +922,7 @@ def emit_warnings(warnings: list[str], full_scan: bool) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments.
+    """コマンドライン引数をパースします。
 
     Returns
     -------
@@ -930,41 +930,41 @@ def parse_args() -> argparse.Namespace:
         パース済みの引数です。
     """
     parser = argparse.ArgumentParser(
-        description="AI validator using Claude."
+        description="Claude を使用した AI バリデーターです。"
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--staged",
         action="store_true",
-        help="Check staged changes (for commit hooks). Default: check working changes.",
+        help="staged な変更をチェックします (commit hook 用)。デフォルト: working な変更をチェックします。",
     )
     mode_group.add_argument(
         "--full-scan",
         action="store_true",
-        help="Check all tracked files regardless of diff (for scanning existing code).",
+        help="diff に関係なく全 tracked ファイルをチェックします (既存コードのスキャン用)。",
     )
     parser.add_argument(
         "--plugin-dir",
         type=Path,
         default=None,
-        help="Plugin directory containing built-in rules/.",
+        help="組み込み rules/ を含むプラグイン ディレクトリです。",
     )
     # ストリーム モード
     parser.add_argument(
         "--stream",
         action="store_true",
-        help="Start stream mode: fork a background worker and print stream-id.",
+        help="ストリーム モードを開始します: バックグラウンド ワーカーを起動し stream-id を出力します。",
     )
     parser.add_argument(
         "--stream-worker",
         action="store_true",
-        help="Internal: run as a stream worker process.",
+        help="内部用: ストリーム ワーカー プロセスとして実行します。",
     )
     parser.add_argument(
         "--stream-id",
         type=str,
         default=None,
-        help="Internal: stream ID for the worker process.",
+        help="内部用: ワーカー プロセスのストリーム ID です。",
     )
     return parser.parse_args()
 
@@ -973,7 +973,7 @@ def resolve_target_files(
     staged: bool,
     full_scan: bool,
 ) -> tuple[list[str], dict[str, str]]:
-    """Determine target files and diff chunks based on the execution mode.
+    """実行モードに基づいてチェック対象ファイルと diff チャンクを決定します。
 
     Parameters
     ----------
@@ -1008,7 +1008,7 @@ def load_file_contents(
     staged: bool,
     full_scan: bool,
 ) -> dict[str, str]:
-    """Load file contents for the given paths.
+    """指定されたパスのファイル内容を読み込みます。
 
     Parameters
     ----------
@@ -1048,7 +1048,7 @@ def run_parallel_checks(
     full_scan: bool,
     max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> list[tuple[str, str, str]]:
-    """Run per-file rule checks in parallel and collect results.
+    """per-file 単位でルール チェックを並列実行し、結果を収集します。
 
     ストリーム モードと同じ per-file 単位 (1 ルール × 1 ファイル) で ``claude -p`` を
     実行します。同時起動数は ``max_workers`` で制限されます。
@@ -1151,7 +1151,7 @@ def run_stream_checks(
     log_file: Path | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> None:
-    """Run per-file rule checks in parallel and write results to disk.
+    """per-file 単位でルール チェックを並列実行し、結果をディスクに書き出します。
 
     Parameters
     ----------
@@ -1234,7 +1234,7 @@ def format_and_output(
     warnings: list[str],
     full_scan: bool,
 ) -> None:
-    """Aggregate check results and output in the appropriate format.
+    """チェック結果を集約し、適切な形式で出力します。
 
     Parameters
     ----------
@@ -1289,7 +1289,7 @@ def format_and_output(
 
 
 def main_stream(args: argparse.Namespace) -> None:
-    """Start stream mode: fork a background worker and print stream-id.
+    """ストリーム モードを開始します: バックグラウンド ワーカーを起動し、stream-id を出力します。
 
     Parameters
     ----------
@@ -1336,7 +1336,7 @@ def main_stream(args: argparse.Namespace) -> None:
 
 
 def main_stream_worker(args: argparse.Namespace) -> None:
-    """Run as a stream worker process (invoked by main_stream).
+    """ストリーム ワーカー プロセスとして実行します (main_stream から起動)。
 
     Parameters
     ----------
@@ -1400,7 +1400,7 @@ def main_stream_worker(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """Run the AI validator: parse args, load rules, and check files."""
+    """AI バリデーターを実行します: 引数パース、ルール読み込み、ファイル チェックを行います。"""
     args = parse_args()
 
     # ストリーム モード: バックグラウンド ワーカーを起動して stream-id を出力します。
@@ -1419,12 +1419,12 @@ def main() -> None:
     git_toplevel = run_git("rev-parse", "--show-toplevel")
     cache_dir = Path(git_toplevel) if git_toplevel else Path.cwd()
 
-    # Resolve target files
+    # チェック対象ファイルを解決します。
     target_files, diff_chunks = resolve_target_files(staged, full_scan)
     if not target_files:
         sys.exit(0)
 
-    # Load rules
+    # ルールを読み込みます。
     project_dirs = find_project_rules_dirs()
     builtin_dir = args.plugin_dir / "rules" if args.plugin_dir else None
     rules, warnings = merge_rules(builtin_dir, project_dirs)
@@ -1436,7 +1436,7 @@ def main() -> None:
     if not rules:
         sys.exit(0)
 
-    # Early exit if no files match any rule
+    # どのルールにもマッチしないなら終了します。
     if not any_file_matches_rules(rules, target_files):
         if warnings:
             emit_warnings(warnings, full_scan)
@@ -1444,7 +1444,7 @@ def main() -> None:
             print("No files match any rule patterns.")
         sys.exit(0)
 
-    # Load file contents
+    # ファイル内容を読み込みます。
     suppressions = load_suppressions(cache_dir)
     cache = CacheStore(path=cache_dir / ".complete-validator" / "cache.json")
     cache.load()
@@ -1462,7 +1462,7 @@ def main() -> None:
     if not files:
         sys.exit(0)
 
-    # Run checks and output results
+    # チェックを実行し結果を出力します。
     config = load_config(cache_dir)
     max_workers = get_max_workers(config)
     results = run_parallel_checks(
