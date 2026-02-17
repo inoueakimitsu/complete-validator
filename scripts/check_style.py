@@ -53,6 +53,8 @@ MAX_STREAM_RESULTS_DIRS = 5
 STREAM_DEADLINE_SECONDS = 3600
 # claude -p の同時起動数のデフォルト上限です。.complete-validator/config.json で上書きできます。
 DEFAULT_MAX_WORKERS = 4
+# claude -p で使用するデフォルト モデルです。.complete-validator/config.json で上書きできます。
+DEFAULT_MODEL = "sonnet"
 
 
 def load_config(config_dir: Path) -> dict:
@@ -94,6 +96,25 @@ def get_max_workers(config: dict) -> int:
     if isinstance(value, int) and value > 0:
         return value
     return DEFAULT_MAX_WORKERS
+
+
+def get_default_model(config: dict) -> str:
+    """config から default_model を取得します。未設定時は DEFAULT_MODEL を返します。
+
+    Parameters
+    ----------
+    config: dict
+        ``load_config()`` で読み込んだ設定の辞書です。
+
+    Returns
+    -------
+    str
+        ``claude -p`` で使用するモデル名です。
+    """
+    value = config.get("default_model")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return DEFAULT_MODEL
 
 
 @dataclass
@@ -639,13 +660,15 @@ def compute_cache_key(
     return hashlib.sha256(cache_key_material.encode("utf-8")).hexdigest()
 
 
-def run_claude_check(prompt: str) -> str:
+def run_claude_check(prompt: str, model: str = DEFAULT_MODEL) -> str:
     """指定されたプロンプトで ``claude -p`` を実行し、応答を返します。
 
     Parameters
     ----------
     prompt: str
         Claude に送信するプロンプトです。
+    model: str
+        使用するモデル名です。
 
     Returns
     -------
@@ -654,8 +677,9 @@ def run_claude_check(prompt: str) -> str:
     """
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
+    cmd = ["claude", "-p", "--model", model]
     result = subprocess.run(
-        ["claude", "-p"],
+        cmd,
         input=prompt,
         capture_output=True,
         text=True,
@@ -823,6 +847,7 @@ def check_single_rule_single_file(
     suppressions: str,
     cache: CacheStore,
     full_scan: bool = False,
+    model: str = DEFAULT_MODEL,
 ) -> tuple[str, str, str, str, bool]:
     """1 つのルールを 1 つのファイルに対してチェックします。
 
@@ -844,6 +869,8 @@ def check_single_rule_single_file(
         キャッシュ ストアです。
     full_scan: bool
         ``True`` ならフル スキャン モードです。
+    model: str
+        ``claude -p`` で使用するモデル名です。
 
     Returns
     -------
@@ -869,7 +896,7 @@ def check_single_rule_single_file(
     )
 
     try:
-        response = run_claude_check(prompt)
+        response = run_claude_check(prompt, model=model)
     except subprocess.TimeoutExpired:
         return rule_name, file_path, "error", f"[{rule_name}:{file_path}] Timed out.", False
     except Exception as e:
@@ -1047,6 +1074,7 @@ def run_parallel_checks(
     cache: CacheStore,
     full_scan: bool,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    model: str = DEFAULT_MODEL,
 ) -> list[tuple[str, str, str]]:
     """per-file 単位でルール チェックを並列実行し、結果を収集します。
 
@@ -1071,6 +1099,8 @@ def run_parallel_checks(
         ``True`` ならフル スキャン モードです。
     max_workers: int
         ``claude -p`` の同時起動数の上限です。
+    model: str
+        ``claude -p`` で使用するモデル名です。
 
     Returns
     -------
@@ -1102,6 +1132,7 @@ def run_parallel_checks(
                 files[fp], diff_chunks.get(fp, ""),
                 suppressions, cache,
                 full_scan=full_scan,
+                model=model,
             )
             futures[future] = (rule_name, fp)
 
@@ -1150,6 +1181,7 @@ def run_stream_checks(
     full_scan: bool = False,
     log_file: Path | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    model: str = DEFAULT_MODEL,
 ) -> None:
     """per-file 単位でルール チェックを並列実行し、結果をディスクに書き出します。
 
@@ -1175,6 +1207,8 @@ def run_stream_checks(
         ワーカー ログのパスです。
     max_workers: int
         ``claude -p`` の同時起動数の上限です。
+    model: str
+        ``claude -p`` で使用するモデル名です。
     """
     def log(msg: str) -> None:
         if log_file:
@@ -1208,6 +1242,7 @@ def run_stream_checks(
                 files[fp], diff_chunks.get(fp, ""),
                 suppressions, cache,
                 full_scan=full_scan,
+                model=model,
             )
             futures[future] = (rule_name, fp)
 
@@ -1391,11 +1426,13 @@ def main_stream_worker(args: argparse.Namespace) -> None:
 
     config = load_config(cache_dir)
     max_workers = get_max_workers(config)
+    default_model = get_default_model(config)
     run_stream_checks(
         rules, target_files, files, diff_chunks,
         suppressions, cache, results_dir,
         full_scan=full_scan, log_file=log_file,
         max_workers=max_workers,
+        model=default_model,
     )
 
 
@@ -1465,9 +1502,11 @@ def main() -> None:
     # チェックを実行し結果を出力します。
     config = load_config(cache_dir)
     max_workers = get_max_workers(config)
+    default_model = get_default_model(config)
     results = run_parallel_checks(
         rules, target_files, files, diff_chunks, suppressions, cache, full_scan,
         max_workers=max_workers,
+        model=default_model,
     )
     format_and_output(results, warnings, full_scan)
 

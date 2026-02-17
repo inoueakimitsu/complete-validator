@@ -320,13 +320,15 @@ applies_to: ["*.py", "*.md"]
 
 ```json
 {
-  "max_workers": 4
+  "max_workers": 4,
+  "default_model": "sonnet"
 }
 ```
 
 | キー | 型 | デフォルト | 説明 |
 |---|---|---|---|
 | `max_workers` | int | 4 | `claude -p` の同時起動数の上限。大きくすると高速になるがメモリ消費が増加します。`claude -p` は 1 プロセスあたり 200-400MB のメモリを消費するため、環境に合わせて調整してください。 |
+| `default_model` | str | sonnet | `claude -p` で使用するデフォルト モデルです。エイリアス (`sonnet`, `haiku` など) またはフルネーム (`claude-sonnet-4-5-20250929` など) を指定できます。 |
 
 ファイルが存在しない場合はデフォルト値が使用されます。
 
