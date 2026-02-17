@@ -8,7 +8,7 @@ Supports four modes:
   - full-scan (--full-scan): validates all tracked files (for scanning existing code)
   - stream (--stream):  background per-file validation with polling results
 
-Runs claude -p per rule file in parallel for better detection accuracy.
+Runs claude -p per (rule file, target file) pair in parallel for better detection accuracy.
 Violations are denied (commit blocked) so the agent must fix them.
 False positives can be suppressed via .complete-validator/suppressions.md.
 """
@@ -25,14 +25,16 @@ import subprocess
 import sys
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 
 
-# v3: ルール ファイル単位の分割並列実行に変更しています。v2 は全ルール一括、v1 はファイル単位でした。
-PROMPT_VERSION = "3"
+# v4: 全モードで per-file 単位 (1 ルール × 1 ファイル) の並列実行に統一しています。
+# v3 は hook がルール単位、ストリームが per-file でした。v2 は全ルール一括、v1 はファイル単位でした。
+PROMPT_VERSION = "4"
 
 # (rule_filename, glob_patterns, body) のリストです。
 RuleList = list[tuple[str, list[str], str]]
@@ -49,6 +51,49 @@ MIN_FUTURE_TIMEOUT_SECONDS = 10
 MAX_STREAM_RESULTS_DIRS = 5
 # ストリーム モードの deadline (秒) です。hook 外で実行するため長めに設定しています。
 STREAM_DEADLINE_SECONDS = 3600
+# claude -p の同時起動数のデフォルト上限です。.complete-validator/config.json で上書きできます。
+DEFAULT_MAX_WORKERS = 4
+
+
+def load_config(config_dir: Path) -> dict:
+    """Load configuration from .complete-validator/config.json.
+
+    Parameters
+    ----------
+    config_dir: Path
+        ``.complete-validator/`` を探すディレクトリです (通常は git toplevel)。
+
+    Returns
+    -------
+    dict
+        設定の辞書です。ファイルが存在しない場合は空辞書を返します。
+    """
+    config_path = config_dir / ".complete-validator" / "config.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def get_max_workers(config: dict) -> int:
+    """Get max_workers from config, falling back to DEFAULT_MAX_WORKERS.
+
+    Parameters
+    ----------
+    config: dict
+        ``load_config()`` で読み込んだ設定の辞書です。
+
+    Returns
+    -------
+    int
+        claude -p の同時起動数の上限です。
+    """
+    value = config.get("max_workers", DEFAULT_MAX_WORKERS)
+    if isinstance(value, int) and value > 0:
+        return value
+    return DEFAULT_MAX_WORKERS
 
 
 @dataclass
@@ -681,105 +726,6 @@ def extract_rule_headings(rule_body: str) -> list[str]:
     return headings
 
 
-def build_prompt_for_rule(
-    rule_name: str,
-    rule_body: str,
-    matched_files: list[str],
-    files: dict[str, str],
-    diff_chunks: dict[str, str],
-    suppressions: str = "",
-    full_scan: bool = False,
-) -> str:
-    """Build the prompt for checking a single rule file against its matched files.
-
-    Parameters
-    ----------
-    rule_name: str
-        ルール ファイル名です。
-    rule_body: str
-        ルール本文です。
-    matched_files: list[str]
-        このルールに一致するファイル パスのリストです。
-    files: dict[str, str]
-        ファイル パスをキー、ファイル内容を値とする辞書です。
-    diff_chunks: dict[str, str]
-        ファイル パスをキー、diff チャンクを値とする辞書です。
-    suppressions: str
-        suppressions の内容です。
-    full_scan: bool
-        ``True`` ならフル スキャン モードです。
-
-    Returns
-    -------
-    str
-        構築されたプロンプト文字列です。
-    """
-    headings = extract_rule_headings(rule_body)
-
-    scope_instruction = (
-        "Check the entire file content against the rules. All code in each file is the check target."
-        if full_scan
-        else "The diff is the primary check target. The full file content is provided for context only."
-    )
-    parts = [
-        "You are a strict AI validator. You MUST check every rule listed for each file. Do not skip any rule.",
-        scope_instruction,
-        "If you are uncertain whether something is a violation, report it with a note that it needs confirmation.",
-        "Be specific: state the file, line, and which rule is violated.",
-        "If there are no violations, respond with exactly: 'No violations found.'",
-        "",
-    ]
-
-    # Rules Checklist
-    if headings:
-        parts.append("## Rules Checklist")
-        parts.append("You must check each of the following rules for every applicable file:")
-        for heading in headings:
-            parts.append(f"- [ ] {heading}")
-        parts.append("")
-
-    # Rule content
-    parts.append(f"=== RULE: {rule_name} ===")
-    parts.append(rule_body)
-    parts.append("")
-
-    # Per-file sections
-    for file_path in matched_files:
-        if file_path not in files:
-            continue
-
-        parts.append(f"=== FILE: {file_path} ===")
-        parts.append("")
-
-        if full_scan:
-            parts.append("--- Full Content (primary check target) ---")
-            parts.append(files[file_path])
-            parts.append("")
-        else:
-            parts.append("--- Changes (primary check target) ---")
-            file_diff = diff_chunks.get(file_path, "")
-            parts.append(file_diff if file_diff else "(no diff available for this file)")
-            parts.append("")
-
-            parts.append("--- Full Content (for context) ---")
-            parts.append(files[file_path])
-            parts.append("")
-
-    # Suppressions
-    if suppressions:
-        parts.append("=== KNOWN SUPPRESSIONS ===")
-        parts.append("以下は既知の例外です。これらに該当する場合は違反として報告しないでください。")
-        parts.append(suppressions)
-        parts.append("")
-
-    # Reminder
-    parts.append("## Reminder")
-    parts.append("Confirm that you have checked every rule in the checklist above for each applicable file.")
-    parts.append("Do not skip any rule. Report all violations found.")
-
-    return "\n".join(parts)
-
-
 def build_prompt_for_single_file(
     rule_name: str,
     rule_body: str,
@@ -937,110 +883,6 @@ def check_single_rule_single_file(
     cache.put(cache_key, message)
     status = "allow" if is_clean else "deny"
     return rule_name, file_path, status, message, False
-
-
-def check_single_rule(
-    rule_name: str,
-    rule_body: str,
-    rule_patterns: list[str],
-    changed_files: list[str],
-    files: dict[str, str],
-    diff_chunks: dict[str, str],
-    suppressions: str,
-    cache: CacheStore,
-    full_scan: bool = False,
-) -> tuple[str, str, str]:
-    """Check a single rule file against its matched files.
-
-    Parameters
-    ----------
-    rule_name: str
-        ルール ファイル名です。
-    rule_body: str
-        ルール本文です。
-    rule_patterns: list[str]
-        ``applies_to`` glob パターンのリストです。
-    changed_files: list[str]
-        チェック対象のファイル パスのリストです。
-    files: dict[str, str]
-        ファイル パスをキー、ファイル内容を値とする辞書です。
-    diff_chunks: dict[str, str]
-        ファイル パスをキー、diff チャンクを値とする辞書です。
-    suppressions: str
-        suppressions の内容です。
-    cache: CacheStore
-        キャッシュ ストアです。
-    full_scan: bool
-        ``True`` ならフル スキャン モードです。
-
-    Returns
-    -------
-    tuple[str, str, str]
-        ``(rule_name, status, message)``。status は ``"deny"``、``"allow"``、``"skip"``、``"error"`` のいずれかです。
-    """
-    matched = files_matching_patterns(rule_patterns, changed_files)
-    matched = [file_path for file_path in matched if file_path in files]
-    if not matched:
-        return rule_name, "skip", ""
-
-    # Per-file cache preflight: ストリーム モードで蓄積された per-file キャッシュを確認します。
-    # 全マッチ ファイルが per-file キャッシュでヒットすれば、claude -p を実行せず集約して即返却します。
-    if not full_scan:
-        per_file_results: list[tuple[str, str]] = []
-        all_hit = True
-        for fp in matched:
-            pf_diff = diff_chunks.get(fp, "")
-            pf_key = compute_cache_key(
-                rule_name, rule_body, pf_diff, suppressions,
-                mode="stream", per_file=True, file_path=fp,
-            )
-            pf_cached = cache.get(pf_key)
-            if pf_cached is None:
-                all_hit = False
-                break
-            pf_is_clean = "[action required]" not in pf_cached.lower()
-            per_file_results.append(("allow" if pf_is_clean else "deny", pf_cached))
-
-        if all_hit and per_file_results:
-            has_deny = any(s == "deny" for s, _ in per_file_results)
-            aggregated = "\n\n".join(msg for _, msg in per_file_results)
-            return rule_name, "deny" if has_deny else "allow", aggregated
-
-    # Build cache key
-    if full_scan:
-        contents_for_hash = "".join(files[file_path] for file_path in sorted(matched))
-        cache_key = compute_cache_key(rule_name, rule_body, contents_for_hash, suppressions, mode="full-scan")
-    else:
-        diff_for_rule = "".join(diff_chunks.get(file_path, "") for file_path in matched)
-        cache_key = compute_cache_key(rule_name, rule_body, diff_for_rule, suppressions)
-
-    # Cache check
-    cached = cache.get(cache_key)
-    if cached is not None:
-        is_clean = "[action required]" not in cached.lower()
-        return rule_name, "allow" if is_clean else "deny", cached
-
-    # Build prompt and run Claude
-    prompt = build_prompt_for_rule(
-        rule_name, rule_body, matched, files, diff_chunks, suppressions, full_scan=full_scan,
-    )
-
-    try:
-        response = run_claude_check(prompt)
-    except subprocess.TimeoutExpired:
-        return rule_name, "error", f"[{rule_name}] Timed out waiting for Claude response."
-    except Exception as e:
-        return rule_name, "error", f"[{rule_name}] Error: {e}"
-
-    # Determine result
-    is_clean = "no violations found" in response.lower()
-    message = f"[Rule: {rule_name}]\n{response}"
-    if not is_clean:
-        message += "\n\n[Action Required]\nFix the violations above and retry the commit.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and retry."
-
-    cache.put(cache_key, message)
-
-    return rule_name, "allow" if is_clean else "deny", message
 
 
 def output_result(decision: str, message: str = "") -> None:
@@ -1204,8 +1046,12 @@ def run_parallel_checks(
     suppressions: str,
     cache: CacheStore,
     full_scan: bool,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> list[tuple[str, str, str]]:
-    """Run rule checks in parallel and collect results.
+    """Run per-file rule checks in parallel and collect results.
+
+    ストリーム モードと同じ per-file 単位 (1 ルール × 1 ファイル) で ``claude -p`` を
+    実行します。同時起動数は ``max_workers`` で制限されます。
 
     Parameters
     ----------
@@ -1223,6 +1069,8 @@ def run_parallel_checks(
         キャッシュ ストアです。
     full_scan: bool
         ``True`` ならフル スキャン モードです。
+    max_workers: int
+        ``claude -p`` の同時起動数の上限です。
 
     Returns
     -------
@@ -1230,31 +1078,63 @@ def run_parallel_checks(
         ``(rule_name, status, message)`` のリスト (ルール名でソート済み) です。
     """
     deadline = time.monotonic() + (FULL_SCAN_DEADLINE_SECONDS if full_scan else HOOK_DEADLINE_SECONDS)
-    results: list[tuple[str, str, str]] = []
 
-    with ThreadPoolExecutor(max_workers=len(rules)) as executor:
+    # (rule_name, rule_body, file_path) のペアを列挙します。
+    units: list[tuple[str, str, str]] = []
+    for rule_name, rule_patterns, rule_body in rules:
+        matched = files_matching_patterns(rule_patterns, target_files)
+        matched = [fp for fp in matched if fp in files]
+        for fp in matched:
+            units.append((rule_name, rule_body, fp))
+
+    if not units:
+        return []
+
+    # per-file 結果を収集します。
+    per_file_results: list[tuple[str, str, str, str, bool]] = []
+
+    with ThreadPoolExecutor(max_workers=min(len(units), max_workers)) as executor:
         futures = {}
-        for rule_name, rule_patterns, rule_body in rules:
+        for rule_name, rule_body, fp in units:
             future = executor.submit(
-                check_single_rule,
-                rule_name, rule_body, rule_patterns,
-                target_files, files, diff_chunks,
+                check_single_rule_single_file,
+                rule_name, rule_body, fp,
+                files[fp], diff_chunks.get(fp, ""),
                 suppressions, cache,
                 full_scan=full_scan,
             )
-            futures[future] = rule_name
+            futures[future] = (rule_name, fp)
 
         for future in as_completed(futures):
             remaining_seconds = deadline - time.monotonic()
             timeout_seconds = max(MIN_FUTURE_TIMEOUT_SECONDS, remaining_seconds)
             try:
                 result = future.result(timeout=timeout_seconds)
-                results.append(result)
+                per_file_results.append(result)
             except Exception as e:
-                failed_rule_name = futures[future]
-                results.append((failed_rule_name, "error", f"[{failed_rule_name}] Error: {e}"))
+                failed_rule, failed_file = futures[future]
+                per_file_results.append((failed_rule, failed_file, "error", f"[{failed_rule}:{failed_file}] Error: {e}", False))
 
-    # ルール名順でソートし、実行ごとの出力を安定させます。
+    # ルール名ごとに集約します。
+    by_rule: dict[str, list[tuple[str, str, str, bool]]] = defaultdict(list)
+    for rule_name, file_path, status, message, cache_hit in per_file_results:
+        by_rule[rule_name].append((file_path, status, message, cache_hit))
+
+    results: list[tuple[str, str, str]] = []
+    for rule_name in sorted(by_rule.keys()):
+        file_results = by_rule[rule_name]
+        has_deny = any(s == "deny" for _, s, _, _ in file_results)
+        has_error = any(s == "error" for _, s, _, _ in file_results)
+        aggregated = "\n\n".join(msg for _, _, msg, _ in file_results if msg)
+        if has_deny:
+            results.append((rule_name, "deny", aggregated))
+        elif has_error:
+            results.append((rule_name, "error", aggregated))
+        elif aggregated:
+            results.append((rule_name, "allow", aggregated))
+        else:
+            results.append((rule_name, "skip", ""))
+
     results.sort(key=lambda r: r[0])
     return results
 
@@ -1269,6 +1149,7 @@ def run_stream_checks(
     results_dir: Path,
     full_scan: bool = False,
     log_file: Path | None = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> None:
     """Run per-file rule checks in parallel and write results to disk.
 
@@ -1292,6 +1173,8 @@ def run_stream_checks(
         ``True`` ならフル スキャン モードです。
     log_file: Path | None
         ワーカー ログのパスです。
+    max_workers: int
+        ``claude -p`` の同時起動数の上限です。
     """
     def log(msg: str) -> None:
         if log_file:
@@ -1316,7 +1199,7 @@ def run_stream_checks(
     log(f"Starting {len(units)} units.")
     deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
 
-    with ThreadPoolExecutor(max_workers=min(len(units), 16)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(units), max_workers)) as executor:
         futures = {}
         for rule_name, rule_body, fp in units:
             future = executor.submit(
@@ -1506,10 +1389,13 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         tracker.mark_completed()
         return
 
+    config = load_config(cache_dir)
+    max_workers = get_max_workers(config)
     run_stream_checks(
         rules, target_files, files, diff_chunks,
         suppressions, cache, results_dir,
         full_scan=full_scan, log_file=log_file,
+        max_workers=max_workers,
     )
 
 
@@ -1577,8 +1463,11 @@ def main() -> None:
         sys.exit(0)
 
     # Run checks and output results
+    config = load_config(cache_dir)
+    max_workers = get_max_workers(config)
     results = run_parallel_checks(
         rules, target_files, files, diff_chunks, suppressions, cache, full_scan,
+        max_workers=max_workers,
     )
     format_and_output(results, warnings, full_scan)
 

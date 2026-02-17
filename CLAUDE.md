@@ -4,6 +4,10 @@
 git commit 時の自動チェック (PreToolUse hook)、任意のタイミングでのオンデマンド チェック、バックグラウンド ストリーム チェックの 3 つのモードをサポートします。
 検出した違反は systemMessage として Claude Code エージェントに返します。
 
+## 開発方針
+
+- **問題を発見してもすぐに対処療法を適用しないでください。** まず根本原因を分析し、設計上の判断として CLAUDE.md や Issue に記録したうえで、適切な修正方針を検討してください。表面的な修正 (マジック ナンバーの追加、条件分岐の追加など) を即座に行うのではなく、問題の全体像を把握してから対処してください。
+
 ## インストール
 
 ### ローカル パスからインストール
@@ -56,14 +60,15 @@ scripts/check_style.py --staged --plugin-dir "$PLUGIN_DIR"
   │  2. git diff --cached --name-only --diff-filter=d で全 staged ファイル取得
   │  3. CWD から上方向に .complete-validator/rules/ を探索し、プラグイン組み込み rules/ とマージ
   │  4. .complete-validator/suppressions.md を読み込み (存在すれば)
-  │  5. git show :<path> で staged 版ファイル内容取得
-  │  6. ルール ファイルごとに並列チェック:
-  │     a. cache key = sha256(prompt_version + rule_name + rule_body + 該当ファイルの diff + suppressions)
-  │     b. キャッシュ ヒット → 即返却 (部分キャッシュ)
-  │     c. プロンプト構築 (1 ルール ファイル + 該当ファイルの diff/全文 + suppressions)
+  │  5. .complete-validator/config.json から max_workers を読み込み (デフォルト 4)
+  │  6. git show :<path> で staged 版ファイル内容取得
+  │  7. per-file 単位 (1 ルール × 1 ファイル) で並列チェック (max_workers で同時起動数を制限):
+  │     a. cache key = sha256(prompt_version + rule_name + file_path + rule_body + diff + suppressions)
+  │     b. キャッシュ ヒット → 即返却
+  │     c. プロンプト構築 (1 ルール ファイル + 1 ファイルの diff/全文 + suppressions)
   │     d. claude -p でチェック実行 (CLAUDECODE 環境変数を除去してネスト検出回避)
   │     e. キャッシュ保存
-  │  7. 全ルールの結果を集約 → deny が 1 つでもあれば全体 deny
+  │  8. ルール名ごとに結果を集約 → deny が 1 つでもあれば全体 deny
   │
   ▼
 Claude Code エージェント
@@ -91,7 +96,7 @@ check_style.py --stream
 check_style.py --stream-worker --stream-id <id>
   │  1. ルールとファイルを読み込み
   │  2. (rule_file, individual_file) ペアを列挙
-  │  3. ThreadPoolExecutor で並列実行 (max 16 ワーカー)
+  │  3. ThreadPoolExecutor で並列実行 (max_workers は config.json で設定、デフォルト 4)
   │  4. 完了するたびに per-file 結果ファイルと status.json を更新
   │
   ▼
@@ -110,9 +115,7 @@ Claude Code エージェント
   - 全 allow なら commit (hook は per-file preflight で高速パス)
 ```
 
-ストリーム モードの処理単位は **1 ルール ファイル × 1 個別ファイル** です。既存の hook モードはルール ファイル単位 (1 ルール × 全マッチ ファイル) ですが、ストリーム モードではより細かい粒度で実行します。
-
-ストリーム モードで蓄積された per-file キャッシュは、hook 実行時の preflight で参照されます。全マッチ ファイルの per-file キャッシュがヒットすれば、`claude -p` を実行せず即返却します。
+全モード共通で処理単位は **1 ルール ファイル × 1 個別ファイル** です。hook モードとストリーム モードは同じ per-file 単位で `claude -p` を実行し、同じキャッシュ空間を共有します。ストリーム モードの結果は hook モードでもそのまま使われます。
 
 ## Plugin ファイル構成
 
@@ -198,14 +201,14 @@ python3 scripts/check_style.py --plugin-dir DIR    # プラグイン ディレ�
 2. **変更ファイル一覧取得**: `git diff --name-only --diff-filter=d` で取得します。staged 時は `--cached` を付与します。
 3. **ルール読み込み**: CWD から上方向に `.complete-validator/rules/` を再帰探索 (`rglob`) し、プラグイン組み込み `rules/` とマージします (nearest wins)。`applies_to` パターンで対象ファイルを絞り込みます。ルール名はディレクトリ相対パス (例: `readable_code/02_naming.md`) です。
 4. **suppressions 読み込み**: プロジェクトの `.complete-validator/suppressions.md` が存在すれば読み込みます。
-5. **ファイル内容取得**: staged モードでは `git show :<path>`、working モードではファイルを直接読み込みます。
-6. **per-file cache preflight**: ストリーム モードで蓄積された per-file キャッシュを確認します。全マッチ ファイルが per-file キャッシュでヒットすれば、`claude -p` を実行せず即返却します。
-7. **ルール ファイルごとに並列チェック**: `ThreadPoolExecutor` でルール ファイル単位に `claude -p` を並列実行します。
-   a. **キャッシュ確認**: `sha256(prompt_version + granularity + rule_name + file_path + rule_body + diff + suppressions)` をキーに部分キャッシュを参照します。
-   b. **プロンプト構築**: 1 ルール ファイル + 該当ファイルの diff/全文 + suppressions で構成します。
+5. **config 読み込み**: `.complete-validator/config.json` から `max_workers` を読み込みます (デフォルト 4)。
+6. **ファイル内容取得**: staged モードでは `git show :<path>`、working モードではファイルを直接読み込みます。
+7. **per-file 単位で並列チェック**: ストリーム モードと同じ処理単位 (1 ルール × 1 ファイル) で `ThreadPoolExecutor` を使って `claude -p` を並列実行します。同時起動数は `max_workers` で制限されます。
+   a. **キャッシュ確認**: `sha256(prompt_version + "per-file" + rule_name + file_path + rule_body + diff + suppressions)` をキーにキャッシュを参照します。
+   b. **プロンプト構築**: 1 ルール ファイル + 1 ファイルの diff/全文 + suppressions で構成します。
    c. **`claude -p` 実行**: `CLAUDECODE` 環境変数を除去してネストセッション検出を回避しつつ実行します。
-   d. **キャッシュ保存**: ルール単位でキャッシュします。
-8. **結果集約**: 全ルールの結果をルール ファイル名でソートして集約します。deny が 1 つでもあれば全体 deny になります。
+   d. **キャッシュ保存**: per-file 単位でキャッシュします。
+8. **結果集約**: ルール名ごとに per-file 結果を集約し、ルール名でソートします。deny が 1 つでもあれば全体 deny になります。
 
 **処理フロー (ストリーム)**
 
@@ -219,9 +222,9 @@ python3 scripts/check_style.py --plugin-dir DIR    # プラグイン ディレ�
 設計上の重要な判断です。
 
 - **ルール ファイルの再帰探索**: `rglob("*.md")` でサブディレクトリ内のルール ファイルも読み込みます。ルールの物理分割により 1 回の `claude -p` のプロンプトが小さくなり、検出精度が向上します。
-- **並列実行**: ルール ファイル数分のワーカーで並列実行し、全体の実行時間を短縮します。ストリーム モードでは最大 16 ワーカーです。
-- **部分キャッシュ**: ルール ファイル単位でキャッシュするため、1 つのルールだけ変更した場合でも他はキャッシュ ヒットします。
-- **per-file キャッシュ**: ストリーム モードは per-file 粒度のキャッシュを使用します。hook 実行時に preflight で参照され、高速パスを実現します。
+- **統一された per-file 実行**: hook モードとストリーム モードは同じ per-file 単位 (1 ルール × 1 ファイル) で `claude -p` を実行します。キャッシュ空間も共有されるため、ストリーム モードの結果が hook モードでもそのまま使われます。
+- **max_workers による同時起動数制限**: `claude -p` は Node.js プロセスで 1 つあたり 200-400MB のメモリを消費します。`.complete-validator/config.json` の `max_workers` (デフォルト 4) で同時起動数を制限し、OOM を防止します。
+- **per-file キャッシュ**: per-file 粒度のキャッシュを使用します。1 つのルールだけ変更した場合でも他はキャッシュ ヒットします。
 - **違反ありの場合は `"permissionDecision": "deny"`**: commit をブロックします。エージェントが違反を修正してから再 commit します。
 - **偽陽性対策**: `.complete-validator/suppressions.md` に記述することで、既知の偽陽性を抑制できます。
 - **エラー時は allow**: `claude -p` のタイムアウト (580 秒) や失敗時は警告メッセージ付きで allow します。
@@ -257,11 +260,11 @@ $PLUGIN_DIR/rules/                            ← 4 番目 (組み込み)
 
 ### プラグイン組み込みルール
 
-`rules/` ディレクトリに `.md` ファイルを追加します。ファイルはアルファベット順に読み込まれます。全プロジェクトに適用されます。
+`rules/` ディレクトリに `.md` ファイルを追加します。サブディレクトリも再帰的に探索 (`rglob`) されるため、関連するルールをサブディレクトリにまとめることができます (例: `rules/readable_code/01_basics.md`)。ファイルはアルファベット順に読み込まれます。全プロジェクトに適用されます。
 
 ### プロジェクト固有ルール
 
-プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加します。そのプロジェクトのみに適用されます。組み込みルールと同名のファイルを置くと、プロジェクト側が優先されます。
+プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加します。サブディレクトリも再帰的に探索されます。そのプロジェクトのみに適用されます。組み込みルールと同名のファイル (相対パスで比較) を置くと、プロジェクト側が優先されます。
 
 ```bash
 # プロジェクト固有ルールのディレクトリを作成
@@ -278,6 +281,7 @@ mkdir -p .complete-validator/rules
 - `## ` 見出しでルールを区切ります
 - 各ルールにルール名、説明、Bad/Good の具体例を記載します
 - 複数ファイルに分割できます (例: `rules/python_style.md`、`rules/naming.md`)
+- サブディレクトリにまとめることもできます (例: `rules/readable_code/01_basics.md`)。ルール名はディレクトリ相対パスになります
 - `applies_to` フロント マターがないルール ファイルはスキップされ、警告メッセージが出力されます
 
 フロント マターの例です。
@@ -303,13 +307,27 @@ applies_to: ["*.py", "*.md"]
 ## キャッシュ
 
 - git toplevel の `$GIT_TOPLEVEL/.complete-validator/cache.json` に保存されます。
-- **per-rule キャッシュ** (hook/オンデマンド): キーは `sha256(prompt_version + "per-rule" + rule_name + rule_body + 該当ファイルの diff + suppressions)` です。
-- **per-file キャッシュ** (ストリーム): キーは `sha256(prompt_version + "per-file" + rule_name + file_path + rule_body + diff + suppressions)` です。per-rule キャッシュとは別空間です。
+- **per-file キャッシュ** (全モード共通): キーは `sha256(prompt_version + "per-file" + rule_name + file_path + rule_body + diff + suppressions)` です。hook モードとストリーム モードで同じキャッシュ空間を共有します。
 - diff、ルール、または suppressions が変わると自動的にキャッシュ ミスになります。
-- 1 つのルールだけ変更した場合、他のルールは部分キャッシュによりキャッシュ ヒットして高速化します。
-- ストリーム モードで蓄積された per-file キャッシュは、hook 実行時の preflight で参照され、高速パスを実現します。
+- 1 つのルールだけ変更した場合、他のルールはキャッシュ ヒットして高速化します。
 - キャッシュ クリアは `rm -f .complete-validator/cache.json` です。
 - `.gitignore` により Git 管理外です。
+
+## 設定ファイル (config.json)
+
+プロジェクトの `.complete-validator/config.json` で動作を設定できます。
+
+```json
+{
+  "max_workers": 4
+}
+```
+
+| キー | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `max_workers` | int | 4 | `claude -p` の同時起動数の上限。大きくすると高速になるがメモリ消費が増加します。`claude -p` は 1 プロセスあたり 200-400MB のメモリを消費するため、環境に合わせて調整してください。 |
+
+ファイルが存在しない場合はデフォルト値が使用されます。
 
 ## 偽陽性の抑制 (suppressions)
 
@@ -415,8 +433,8 @@ rm -f .complete-validator/cache.json
 
 | # | シナリオ | 期待動作 |
 |---|---|---|
-| 1 | `*.py` のみ commit | python_style + japanese_comment_style が適用される |
-| 2 | `*.md` のみ commit | japanese_comment_style のみが適用される |
+| 1 | `*.py` のみ commit | python_style + readable_code/* + japanese_comment_style/* が適用される |
+| 2 | `*.md` のみ commit | japanese_comment_style/* のみが適用される |
 | 3 | `*.py` + `*.md` 混在 commit | 各ファイルに正しいルールが適用される |
 | 4 | どのルールにもマッチしない拡張子のみ (`*.txt` など) | チェックがスキップされる |
 | 5 | `applies_to` なしのルール ファイルを追加 | スキップされ、警告メッセージが出る |
@@ -608,7 +626,7 @@ env -u CLAUDECODE claude --dangerously-skip-permissions
 | Claude Code 起動 | 8 秒 |
 | `/plugin` コマンド | 5-10 秒 |
 | ファイル編集 + `git commit` (hook なし) | 30-60 秒 |
-| ファイル編集 + `git commit` (hook あり、キャッシュ ミス) | 2-3 分 |
+| ファイル編集 + `git commit` (hook あり、キャッシュ ミス) | 3-5 分 (ルール数 × ファイル数 / max_workers に依存) |
 | ファイル編集 + `git commit` (hook あり、キャッシュ ヒット) | 30-60 秒 |
 
 #### capture-pane で結果を取得します
@@ -655,4 +673,4 @@ chmod +x .git/hooks/pre-push
 ## 制限事項
 
 - `claude -p` の呼び出しに数秒～数十秒かかります。キャッシュ ヒット時は 0.3 秒程度です。
-- 大量のファイルを一度に commit するとプロンプトが大きくなり、API の制限に達する可能性があります。
+- ルール数 × ファイル数の組み合わせが多い場合、`max_workers` (デフォルト 4) で並列数を制限しているため全体の実行時間が長くなります。

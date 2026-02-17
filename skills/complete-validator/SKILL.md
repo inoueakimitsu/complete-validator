@@ -107,6 +107,18 @@ cat .complete-validator/stream-results/<stream-id>/results/*.json
 
 ### プロジェクト固有ルール
 
-プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加してください。そのプロジェクトのみに適用されます。組み込みルールと同名のファイルを置くと、nearest wins でプロジェクト側が優先されます。
+プロジェクトの `.complete-validator/rules/` ディレクトリに `.md` ファイルを追加してください。サブディレクトリも再帰的に探索されます。そのプロジェクトのみに適用されます。組み込みルールと同名のファイルを置くと、nearest wins でプロジェクト側が優先されます。
 
 いずれの場合も `## ` 見出しでルールを区切り、Bad/Good の具体例を記載します。
+
+## 設定
+
+プロジェクトの `.complete-validator/config.json` で `claude -p` の同時起動数を調整できます。
+
+```json
+{
+  "max_workers": 4
+}
+```
+
+デフォルトは 4 です。メモリに余裕がある環境では値を大きくすることで高速化できます。
