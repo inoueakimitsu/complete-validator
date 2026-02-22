@@ -709,6 +709,64 @@ tmux capture-pane -t test-cv -p -S -50 | grep -c "Blocked by hook"
 #   Error: Hook PreToolUse:Bash denied this tool
 ```
 
+#### Windows では WSL 内で実行してください
+
+`check_style.sh` は `python3` コマンドを使用します。Windows の MSYS2/Git Bash 環境では `python3` が利用できないことがあるため、Windows で tmux E2E テストを行う場合は WSL 内で実行してください。Linux/macOS ではそのまま実行できます。
+
+```bash
+# Windows: WSL 経由で tmux を操作する
+wsl bash -c 'tmux new-session -d -s test-cv -c /tmp/test-cv -x 200 -y 50'
+wsl bash -c 'tmux send-keys -t test-cv "env -u CLAUDECODE claude --dangerously-skip-permissions" Enter'
+wsl bash -c 'sleep 10 && tmux capture-pane -t test-cv -p -S -50'
+
+# Linux/macOS: 直接実行する
+tmux new-session -d -s test-cv -c /tmp/test-cv -x 200 -y 50
+tmux send-keys -t test-cv "env -u CLAUDECODE claude --dangerously-skip-permissions" Enter
+sleep 10 && tmux capture-pane -t test-cv -p -S -50
+```
+
+#### クリーン インストールでバージョンを更新する
+
+プラグインのキャッシュ (`~/.claude/plugins/cache/`) は `version` 単位で保存されます。ソースを変更して push した場合、バージョンも更新しないとキャッシュが古いまま残ります。最新版を反映するには以下の手順でクリーン インストールしてください。
+
+```bash
+# tmux 内の Claude Code で実行
+/plugin uninstall complete-validator@complete-validator --scope project
+/plugin marketplace remove complete-validator
+/plugin marketplace add inoueakimitsu/complete-validator
+/plugin install complete-validator@complete-validator --scope project
+# → "Restart Claude Code to load new plugins." と表示されるので再起動が必要
+/exit
+```
+
+再起動後、`~/.claude/plugins/cache/complete-validator/complete-validator/` に新しいバージョンのディレクトリが作成されていることを確認します。
+
+#### hook の deny → 修正ループは時間がかかる
+
+エージェントが hook deny を受けて修正 → 再 commit を繰り返すため、1 回の E2E テストに **10 分以上** かかることがあります (ルール数 × ファイル数 / max_workers に依存)。hook の発火確認だけが目的の場合は、最初の deny 後に `cache.json` の存在と内容を確認すれば十分です。commit が成功するまで待つ必要はありません。
+
+```bash
+# hook 発火中でもキャッシュは随時書き込まれるため、別ターミナルから確認可能
+ls -la /tmp/test-cv/.complete-validator/cache.json
+python3 -c "
+import json
+data = json.load(open('/tmp/test-cv/.complete-validator/cache.json'))
+print(f'entries: {len(data)}')
+key = next(iter(data))
+print(json.dumps(data[key], indent=2, ensure_ascii=False))
+"
+```
+
+#### `/plugin install --scope project` はメニュー選択が必要
+
+`--scope project` を指定しても対話メニューが表示されることがあります。tmux から操作する場合は `Down` + `Enter` で 2 番目の選択肢 (project scope) を選んでください。
+
+```bash
+tmux send-keys -t test-cv Down
+sleep 0.3
+tmux send-keys -t test-cv Enter
+```
+
 ## バージョン管理
 
 機能追加やバグ修正を行った場合、以下の 2 ファイルのバージョンを更新してください。
