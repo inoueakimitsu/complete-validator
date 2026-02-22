@@ -100,6 +100,7 @@ WATCH_MEDIUM_PRIORITY_KEYWORDS = (
     "audit",
     "rate limit",
 )
+SUPPORTED_CONTEXT_LEVELS = {"diff", "full_file", "smart"}
 
 
 def _default_rule_config() -> dict:
@@ -361,6 +362,27 @@ def get_cache_ttl_seconds(config: dict) -> int:
     if isinstance(value, int) and value > 0:
         return value
     return DEFAULT_CACHE_TTL_SECONDS
+
+
+def get_cache_enabled(config: dict) -> bool:
+    value = config.get("cache", True)
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def get_context_level(config: dict) -> str:
+    value = str(config.get("context_level", "diff")).strip().lower()
+    if value in SUPPORTED_CONTEXT_LEVELS:
+        return value
+    return "diff"
+
+
+def get_batching_enabled(config: dict) -> bool:
+    value = config.get("batching", False)
+    if isinstance(value, bool):
+        return value
+    return False
 
 
 @dataclass
@@ -1805,6 +1827,8 @@ def check_single_rule_single_file(
     cache: CacheStore,
     full_scan: bool = False,
     model: str = DEFAULT_MODEL,
+    context_level: str = "diff",
+    cache_enabled: bool = True,
 ) -> tuple[str, str, str, str, bool]:
     """1 つのルールを 1 つのファイルに対してチェックします。
 
@@ -1834,22 +1858,33 @@ def check_single_rule_single_file(
     tuple[str, str, str, str, bool]
         ``(rule_name, file_path, status, message, cache_hit)`` です。
     """
-    mode = "full-scan" if full_scan else "stream"
-    diff_or_content = file_content if full_scan else file_diff
+    effective_context = context_level if context_level in SUPPORTED_CONTEXT_LEVELS else "diff"
+    use_full_content = full_scan
+    if not full_scan:
+        if effective_context == "full_file":
+            use_full_content = True
+        elif effective_context == "smart":
+            diff_len = len(file_diff or "")
+            content_len = len(file_content or "")
+            use_full_content = (diff_len == 0) or (content_len > 0 and diff_len > content_len * 0.6)
+
+    mode = "full-scan" if use_full_content else "stream"
+    diff_or_content = file_content if use_full_content else file_diff
     cache_key = compute_cache_key(
         rule_name, rule_body, diff_or_content, suppressions,
         mode=mode, per_file=True, file_path=file_path,
     )
 
-    cached = cache.get(cache_key)
-    if cached is not None:
-        is_clean = "[action required]" not in cached.lower()
-        status = "allow" if is_clean else "deny"
-        return rule_name, file_path, status, cached, True
+    if cache_enabled:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            is_clean = "[action required]" not in cached.lower()
+            status = "allow" if is_clean else "deny"
+            return rule_name, file_path, status, cached, True
 
     prompt = build_prompt_for_single_file(
         rule_name, rule_body, file_path, file_content, file_diff,
-        suppressions, full_scan=full_scan,
+        suppressions, full_scan=use_full_content,
     )
 
     try:
@@ -1864,7 +1899,8 @@ def check_single_rule_single_file(
     if not is_clean:
         message += "\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md."
 
-    cache.put(cache_key, message)
+    if cache_enabled:
+        cache.put(cache_key, message)
     status = "allow" if is_clean else "deny"
     return rule_name, file_path, status, message, False
 
@@ -2337,6 +2373,9 @@ def run_parallel_checks(
     max_workers: int = DEFAULT_MAX_WORKERS,
     model: str = DEFAULT_MODEL,
     cross_file_targets: set[str] | None = None,
+    context_level: str = "diff",
+    cache_enabled: bool = True,
+    batching_enabled: bool = False,
 ) -> list[tuple[str, str, str]]:
     """per-file 単位でルール チェックを並列実行し、結果を収集します。
 
@@ -2383,6 +2422,9 @@ def run_parallel_checks(
     if not units:
         return []
 
+    if batching_enabled:
+        units.sort(key=lambda item: (item[2], item[0]))
+
     # per-file 結果を収集します。
     per_file_results: list[tuple[str, str, str, str, bool]] = []
 
@@ -2396,6 +2438,8 @@ def run_parallel_checks(
                 suppressions, cache,
                 full_scan=full_scan,
                 model=model,
+                context_level=context_level,
+                cache_enabled=cache_enabled,
             )
             futures[future] = (rule_name, fp)
 
@@ -2447,6 +2491,9 @@ def run_stream_checks(
     model: str = DEFAULT_MODEL,
     stream_id: str = "",
     cross_file_targets: set[str] | None = None,
+    context_level: str = "diff",
+    cache_enabled: bool = True,
+    batching_enabled: bool = False,
 ) -> None:
     """per-file 単位でルール チェックを並列実行し、結果をディスクに書き出します。
 
@@ -2495,6 +2542,9 @@ def run_stream_checks(
         tracker.mark_completed()
         return
 
+    if batching_enabled:
+        units.sort(key=lambda item: (item[2], item[0]))
+
     tracker = StreamStatusTracker(results_dir=results_dir, total_units=len(units))
     log(f"Starting {len(units)} units.")
     deadline = time.monotonic() + STREAM_DEADLINE_SECONDS
@@ -2509,6 +2559,8 @@ def run_stream_checks(
                 suppressions, cache,
                 full_scan=full_scan,
                 model=model,
+                context_level=context_level,
+                cache_enabled=cache_enabled,
             )
             futures[future] = (rule_name, fp)
 
@@ -3097,6 +3149,9 @@ def main_stream_worker(args: argparse.Namespace) -> None:
 
     max_workers = get_max_workers(config)
     default_model = get_default_model(config)
+    context_level = get_context_level(config)
+    cache_enabled = get_cache_enabled(config)
+    batching_enabled = get_batching_enabled(config)
     run_stream_checks(
         rules, target_files, files, diff_chunks,
         suppressions, cache, results_dir,
@@ -3105,6 +3160,9 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         model=default_model,
         stream_id=stream_id,
         cross_file_targets=cross_file_targets,
+        context_level=context_level,
+        cache_enabled=cache_enabled,
+        batching_enabled=batching_enabled,
     )
 
 
@@ -3215,11 +3273,17 @@ def main() -> None:
     # チェックを実行し結果を出力します。
     max_workers = get_max_workers(config)
     default_model = get_default_model(config)
+    context_level = get_context_level(config)
+    cache_enabled = get_cache_enabled(config)
+    batching_enabled = get_batching_enabled(config)
     results = run_parallel_checks(
         rules, target_files, files, diff_chunks, suppressions, cache, full_scan,
         max_workers=max_workers,
         model=default_model,
         cross_file_targets=cross_file_targets,
+        context_level=context_level,
+        cache_enabled=cache_enabled,
+        batching_enabled=batching_enabled,
     )
     format_and_output(results, warnings, full_scan)
 
