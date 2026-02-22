@@ -186,6 +186,26 @@ def _apply_lock_hysteresis(
             deny_streaks[rule_name] = 0
 
 
+def _apply_lock_unlock_by_change(
+    append_text: str,
+    locked_rules: set[str],
+    deny_streaks: dict[str, int],
+    unlock_on_change_keywords: dict[str, list[str]],
+) -> None:
+    if not locked_rules:
+        return
+    changed = (append_text or "").lower()
+    if not changed:
+        return
+    for rule_name in list(locked_rules):
+        keywords = unlock_on_change_keywords.get(rule_name, [])
+        if not keywords:
+            continue
+        if any(keyword in changed for keyword in keywords):
+            locked_rules.discard(rule_name)
+            deny_streaks[rule_name] = 0
+
+
 def _sanitize_recorded_payload(payload: dict) -> dict:
     sanitized = dict(payload)
     sanitized["stdout"] = "[SANITIZED]"
@@ -590,6 +610,17 @@ def run_dynamic(
             for ann in fixture.annotations
             if isinstance(ann, dict) and ann.get("lock_on_satisfy")
         }
+        unlock_on_change_keywords: dict[str, list[str]] = {}
+        for ann in fixture.annotations:
+            if not isinstance(ann, dict):
+                continue
+            rule_name = str(ann.get("rule", ""))
+            raw_keywords = ann.get("unlock_on_change_keywords", [])
+            if not rule_name or not isinstance(raw_keywords, list):
+                continue
+            normalized = [str(item).strip().lower() for item in raw_keywords if str(item).strip()]
+            if normalized:
+                unlock_on_change_keywords[rule_name] = normalized
         locked_rules: set[str] = set()
         lock_deny_streaks: dict[str, int] = {}
         try:
@@ -598,6 +629,12 @@ def run_dynamic(
                 append_text = str(step_item.get("append", ""))
                 with target_path.open("a", encoding="utf-8") as handle:
                     handle.write(append_text)
+                _apply_lock_unlock_by_change(
+                    append_text=append_text,
+                    locked_rules=locked_rules,
+                    deny_streaks=lock_deny_streaks,
+                    unlock_on_change_keywords=unlock_on_change_keywords,
+                )
 
                 stream_id, entries = _run_stream_once(work_dir, runner_cfg, plugin_dir, wait_seconds)
                 _claim_and_resolve_all(work_dir, runner_cfg, plugin_dir, stream_id, entries)

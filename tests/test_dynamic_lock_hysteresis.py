@@ -74,3 +74,37 @@ def test_lock_hysteresis_locks_when_rule_becomes_allow():
 
     assert "meeting_rules/security_discussion.md" in locked
     assert streaks["meeting_rules/security_discussion.md"] == 0
+
+
+def test_unlock_by_change_keyword_immediately_releases_lock():
+    harness = _load_test_harness_module()
+    locked = {"meeting_rules/security_discussion.md"}
+    streaks = {"meeting_rules/security_discussion.md": 1}
+    unlock_map = {"meeting_rules/security_discussion.md": ["security", "threat model"]}
+
+    harness._apply_lock_unlock_by_change(
+        append_text="Added SECURITY appendix and checklist",
+        locked_rules=locked,
+        deny_streaks=streaks,
+        unlock_on_change_keywords=unlock_map,
+    )
+
+    assert "meeting_rules/security_discussion.md" not in locked
+    assert streaks["meeting_rules/security_discussion.md"] == 0
+
+
+def test_unlock_by_change_keyword_does_not_unlock_when_unrelated_change():
+    harness = _load_test_harness_module()
+    locked = {"meeting_rules/security_discussion.md"}
+    streaks = {"meeting_rules/security_discussion.md": 1}
+    unlock_map = {"meeting_rules/security_discussion.md": ["security", "threat model"]}
+
+    harness._apply_lock_unlock_by_change(
+        append_text="Added participant introductions and schedule",
+        locked_rules=locked,
+        deny_streaks=streaks,
+        unlock_on_change_keywords=unlock_map,
+    )
+
+    assert "meeting_rules/security_discussion.md" in locked
+    assert streaks["meeting_rules/security_discussion.md"] == 1
