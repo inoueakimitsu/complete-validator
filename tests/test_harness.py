@@ -113,7 +113,14 @@ def run_static(
     plugin_dir = _plugin_dir_for_mode(runner_cfg.root, mode)
 
     results = []
-    timing = {"wall_time": 0.0, "llm_calls": 0}
+    timing = {
+        "mode": "recorded" if recorded else "live",
+        "wall_time": 0.0,
+        "wall_time_total": 0.0,
+        "wall_time_live_check": 0.0,
+        "wall_time_recorded_replay": 0.0,
+        "llm_calls": 0,
+    }
     all_rule_results = []
 
     from runner import run_check_once
@@ -133,7 +140,13 @@ def run_static(
             mode=mode,
             use_recorded=recorded,
         )
-        timing["wall_time"] += run_result.elapsed_ms / 1000.0
+        elapsed_seconds = run_result.elapsed_ms / 1000.0
+        timing["wall_time"] += elapsed_seconds
+        timing["wall_time_total"] += elapsed_seconds
+        if recorded:
+            timing["wall_time_recorded_replay"] += elapsed_seconds
+        else:
+            timing["wall_time_live_check"] += elapsed_seconds
         timing["llm_calls"] += max(len(run_result.rule_results), 1)
         metrics = evaluate_fixture(fixture, run_result)
         results.append(metrics)
@@ -461,7 +474,14 @@ def run_dynamic(
     details = {
         "fixtures": all_rule_results,
         "metric": agg,
-        "timing": {"wall_time": total_ms / 1000.0, "llm_calls": len(all_rule_results)},
+        "timing": {
+            "mode": "live",
+            "wall_time": total_ms / 1000.0,
+            "wall_time_total": total_ms / 1000.0,
+            "wall_time_live_check": total_ms / 1000.0,
+            "wall_time_recorded_replay": 0.0,
+            "llm_calls": len(all_rule_results),
+        },
     }
     return agg, details
 

@@ -739,3 +739,496 @@ chmod +x .git/hooks/pre-push
 
 - `claude -p` の呼び出しに数秒～数十秒かかります。キャッシュ ヒット時は 0.3 秒程度です。
 - ルール数 × ファイル数の組み合わせが多い場合、`max_workers` (デフォルト 4) で並列数を制限しているため全体の実行時間が長くなります。
+
+## 実装同期リファレンス (2026-02-22)
+
+このセクションは、現在の実装 (`scripts/check_style.py` と `tests/`) と 1:1 で対応する運用リファレンスです。オンボーディング時は本セクションを優先して参照してください。
+
+### 最適化目標 (plan.md 依存をなくすための定義)
+
+本システムは、次の目的関数を最小化する設計です。
+
+`minimize α·C_monetary + β·C_time + γ·C_false_negative (+ δ·C_disruption in dynamic mode)`
+
+各項の意味:
+
+- `C_monetary`: LLM 入出力トークンに比例する実行コスト。
+- `C_time`: チェック完了までの壁時計時間。動的モードでは `C_latency` (追記から指摘までの遅延) を重視する。
+- `C_false_negative`: 本来検出すべき violation の見逃しコスト。severity を重みとして扱う。
+- `C_disruption`: 動的介入での誤警告による業務妨害コスト (主に会議・共同編集向け)。
+
+補足:
+
+- `α, β, γ, δ` は運用コンテキストで変える重み。commit hook では `γ` を高く、リアルタイム介入では `β` と `δ` を高く置く。
+- 静的チェックでは `C_disruption` は通常 0 とみなす。
+
+### 実装での代理指標 (測定可能な形への写像)
+
+上の目的関数は、現実装では次の指標に写像して評価します。
+
+- `C_false_negative` の代理:
+  - `tests/evaluator.py` の `recall` と `F1`
+  - `tests/test_harness.py --scenario regression` での F1 drop ゲート
+- `C_time` / `C_latency` の代理:
+  - `summary.json` の `timing.wall_time`
+  - dynamic シナリオの step ごとの stream 完了時間
+- `C_monetary` の代理:
+  - `llm_calls`、`default_model`、`max_workers`、`cache_hit` 率
+  - baseline/optimized 比較時のモデル選択差 (`sonnet` vs `haiku`)
+- `C_disruption` の代理:
+  - dynamic での `false_positives`、`expected_by_step` に対する過剰警告率
+
+設計上の判定原則:
+
+- 最適化変更は、`F1` を劣化させずに (`regression-max-drop` を超えずに) `wall_time` と `llm_calls` を下げる方向のみ採用する。
+- いずれかを改善しても見逃しが増える変更は採用しない。
+
+### 現在の実装スコープ
+
+- 本体は `scripts/check_style.py` に集約されています。
+- stream 結果 (`.complete-validator/stream-results/`) と violation queue (`.complete-validator/violations/`) は別管理です。
+- queue 操作は `--list-violations` / `--claim` / `--resolve` で実行します。
+- CI 専用ゲートは持たず、ローカルゲート (`tests/run_local_gate.sh`) を標準運用とします。
+
+### モジュール図 (実装準拠)
+
+```text
+hooks/hooks.json (PreToolUse:Bash)
+  -> scripts/check_style.sh
+      -> scripts/check_style.py (--staged)
+
+scripts/check_style.py
+  - mode router:
+    - default / --staged / --full-scan
+    - --stream (parent)
+    - --stream-worker (child)
+    - --list-violations / --claim / --resolve
+  - rule loading:
+    - plugin rules + project .complete-validator/rules (nearest wins)
+  - execution:
+    - per-file unit (rule x file)
+    - ThreadPoolExecutor(max_workers from config)
+    - claude -p (cache aware)
+  - persistence:
+    - .complete-validator/cache.json
+    - .complete-validator/stream-results/<stream-id>/{status.json,results/*.json,worker.log}
+    - .complete-validator/violations/results/<id>.json (append)
+    - .complete-validator/violations/queue/<priority>__<status>__<id>.state.json
+
+tests/test_harness.py
+  -> tests/fixture_manager.py (fixture loading)
+  -> tests/runner.py (live/recorded execution)
+  -> tests/evaluator.py (precision/recall/f1)
+  -> tests/reporter.py (summary output)
+  -> tests/results/** (persisted summaries)
+```
+
+### シーケンス図 1: commit hook
+
+```mermaid
+sequenceDiagram
+    participant A as Agent (Bash: git commit ...)
+    participant H as PreToolUse hook (hooks/hooks.json)
+    participant S as scripts/check_style.sh
+    participant P as scripts/check_style.py (--staged)
+
+    A->>H: Bash tool call
+    H->>S: stdin JSON (tool_input.command)
+    S->>S: command parse
+    S->>S: pre git add (compound command only)
+    S->>P: --staged --plugin-dir
+    P->>P: resolve target files / diff
+    P->>P: load rules + suppressions + config
+    P->>P: parallel per-file checks (claude -p, cache)
+    P->>P: aggregate results
+    P-->>S: allow / deny payload
+    S-->>A: commit proceed or blocked
+```
+
+### シーケンス図 2: stream + queue lifecycle
+
+```mermaid
+sequenceDiagram
+    participant U as User/Agent
+    participant P as check_style.py (--stream parent)
+    participant W as check_style.py (--stream-worker)
+    participant SR as stream-results/<stream-id>
+    participant Q as violations/queue
+    participant C as Consumer (agent or harness)
+
+    U->>P: start --stream
+    P-->>U: stream-id (parent exits)
+    P->>W: spawn worker
+    W->>W: per-file checks in parallel
+    W->>SR: write results/*.json
+    W->>Q: upsert queue state
+    W->>SR: update status.json
+
+    C->>Q: --list-violations <stream-id>
+    C->>Q: --claim <stream-id> <violation-id>
+    Q-->>C: in_progress + lease_ttl + claim_uuid + state_version
+    C->>C: fix file
+    C->>Q: --resolve ... --claim-uuid --state-version
+    Q-->>C: resolved (CAS success)
+```
+
+### シーケンス図 3: テストハーネス
+
+```mermaid
+sequenceDiagram
+    participant T as tests/test_harness.py
+    participant F as Fixture repo
+    participant R as runner.py
+    participant V as check_style.py
+    participant E as evaluator.py
+    participant O as tests/results/**/summary.json
+
+    alt static
+        T->>F: init static fixture repo
+        T->>R: run_check_once(full-scan)
+        R->>V: execute check
+        V-->>R: rule results
+        R-->>T: CheckResult
+        T->>E: evaluate_fixture
+        E-->>T: metrics
+        T->>O: write summary
+        Note over T: optional --record / --recorded
+    else dynamic
+        T->>F: init dynamic fixture repo
+        loop each step
+            T->>F: append transcript chunk
+            T->>V: run --stream
+            T->>V: wait status completed
+            T->>V: read stream results
+            T->>E: evaluate by step
+            T->>V: claim/resolve violations
+        end
+        T->>O: write summary
+    else regression
+        T->>O: load previous/latest summaries
+        T->>T: compare F1 drop vs threshold
+        T->>O: write regression_*.json
+    end
+```
+
+### Queue データモデル (実装準拠)
+
+- ID: `sha256(rule_id + canonical_file_path)` (64hex)
+- queue ファイル名: `<priority>__<status>__<id>.state.json`
+- 主状態: `pending` / `in_progress` / `resolved` / `manual_review` / `stale`
+- 排他制御:
+  - `_replace_state_file()` による atomic 遷移
+  - `claim_uuid` + `state_version` で resolve CAS
+  - lease 期限切れは `_force_expired_to_pending()` で回収
+  - 同一 target file の二重 in-progress は claim 時に拒否
+
+### 主要エントリポイント (運用コマンド)
+
+```bash
+# 通常チェック
+python3 scripts/check_style.py
+python3 scripts/check_style.py --staged
+python3 scripts/check_style.py --full-scan
+
+# stream
+python3 scripts/check_style.py --stream --plugin-dir /path/to/complete-validator
+python3 scripts/check_style.py --list-violations <stream-id>
+python3 scripts/check_style.py --claim <stream-id> <violation-id>
+python3 scripts/check_style.py --resolve <stream-id> <violation-id> --claim-uuid <uuid> --state-version <n>
+
+# ローカルゲート (API不要)
+bash tests/run_local_gate.sh
+
+# 録画更新 (必要時)
+bash tests/update_recordings.sh
+```
+
+### オンボーディング最短手順 (背景知識なし想定)
+
+1. `CLAUDE.md` の「実装同期リファレンス」を先に読む。
+2. `scripts/check_style.py` の `main()` / `main_stream()` / `main_stream_worker()` / `handle_claim()` / `handle_resolve()` を追う。
+3. `tests/test_harness.py` の `run_static()` / `run_dynamic()` / `run_regression()` を追う。
+4. `bash tests/run_local_gate.sh` を実行し、ローカルで回帰ゲートが通ることを確認する。
+5. 変更時は本セクションの図・データモデル・運用コマンドを同時更新する。
+
+### 保守ルール (このドキュメントの更新基準)
+
+- queue 状態遷移を変更したら、必ず:
+  - シーケンス図 2
+  - Queue データモデル
+  - 主要エントリポイント
+  を同一 PR で更新する。
+- ハーネス仕様 (`--recorded`, `--record`, dynamic 評価) を変更したら、必ず:
+  - シーケンス図 3
+  - オンボーディング最短手順
+  を更新する。
+- ローカルゲート方針を優先し、GitHub Actions 前提の手順は記載しない。
+
+## オンボーディングで押さえる設計変更点
+
+### 1. queue は「検出結果」ではなく「作業状態」を管理する
+
+現在の queue 設計は、違反検出の生データと修正ワークフローの状態を分離しています。
+
+- 生データは `.complete-validator/violations/results/*.json` に追記される。
+- 作業状態は `.complete-validator/violations/queue/*.state.json` で管理する。
+- `--claim` / `--resolve` は queue state のみを更新する。
+
+この分離により、再チェックで検出結果が更新されても、修正中の claim 状態が壊れにくくなっています。
+
+### 2. claim/resolve は CAS と lease で保護する
+
+複数 consumer を前提に、queue の競合制御は次のルールで統一されています。
+
+- `--claim` は `claim_uuid` と `state_version` を発行し、`in_progress` に遷移する。
+- `--resolve` は `claim_uuid` と `state_version` が一致した場合のみ成功する。
+- lease 期限を超えた `in_progress` は `pending` に回収される。
+- 同一 `target_file_path` で active claim がある場合、新規 claim は拒否する。
+
+運用上の既定値は次のとおりです。
+
+- `lease_ttl` のデフォルトは 300 秒。
+- lease 判定には 30 秒の grace を持たせる。
+
+設計上の意味は「修正担当の一意化」と「落ちた worker の自然回復」です。
+
+### 3. ハーネスは static/dynamic/regression の 3 層で評価する
+
+テストハーネスの役割は、単発判定ではなく運用ループ全体の品質保証です。
+
+- `static`: fixture 単位で検出精度を測る。
+- `dynamic`: stream 実行と claim/resolve の往復を step ごとに評価する。
+- `regression`: 直近結果同士を比較し、F1 の劣化をゲートする。
+
+`--recorded` は static 専用です。dynamic の正しさは stream 結果と queue 遷移を使って評価します。
+
+### 4. dynamic 評価は step ごとの期待値で判定する
+
+dynamic fixture では、最終状態だけでなく途中経過も仕様です。
+
+- `expected_by_step` で各 step の期待値を持つ。
+- `irrelevant` を許容し、早期ステップでの過剰警告を false positive として扱える。
+- `lock_on_satisfy: true` のルールは、一度 satisfied になった後の step 評価でロックを反映する。
+
+この設計により、リアルタイム追記型の検証挙動を再現できます。
+
+### 5. baseline と optimized は「比較可能な別運用」として維持する
+
+設定は単なるモデル差し替えではなく、運用プロファイルとして分離しています。
+
+- baseline: 保守的 (`sonnet`, 低めの並列度)。
+- optimized: 低コスト寄り (`haiku`, 高めの並列度、batch/cache 有効)。
+
+比較時は両設定を別 run として実行し、同一 config の使い回しで比較しません。
+
+現行の具体値は次のとおりです。
+
+- `tests/configs/baseline.json`
+  - `default_model: sonnet`
+  - `max_workers: 2`
+  - `batching: false`
+  - `context_level: diff`
+- `tests/configs/optimized.json`
+  - `default_model: haiku`
+  - `max_workers: 4`
+  - `batching: true`
+  - `context_level: smart`
+  - `cache: true`
+
+重要:
+
+- `scripts/check_style.py` が現在直接参照する config キーは `default_model` と `max_workers`。
+- `batching` / `context_level` / `cache` は、現時点では「運用プロファイルとハーネス比較の意味づけ」に使うキーであり、バリデータ本体の実行経路を直接切り替える仕様としては未実装。
+- したがって、この3キーを変更しても `check_style.py` の実行ロジック自体は自動では変わらない。意味を持たせる場合は実装変更を伴う。
+
+### 6. ゲートはローカルで即時再現できることを優先する
+
+回帰チェックは GitHub Actions 前提にせず、ローカルで反復可能な形に固定しています。
+
+- 標準ゲートは `bash tests/run_local_gate.sh`。
+- 回帰結果は scenario ごとに分離出力する (`regression_static.json`, `regression_dynamic.json`)。
+
+この方針により、API 呼び出しを伴う CI に依存せず、開発者がその場で品質判定を再現できます。
+
+### 7. queue の優先度は severity から機械的に決まる
+
+queue ファイル名の `priority` は任意値ではなく、severity から固定マッピングで決定します。
+
+- `critical -> 0`
+- `high -> 100`
+- `medium -> 200`
+- `low -> 300`
+- `info -> 400`
+- その他/不明 -> `500`
+
+ファイル名は 3 桁ゼロ埋め (`000`-`999`) で保存され、辞書順列挙で高優先度から処理できる設計です。
+
+## 設計背景 (plan.md 由来、オンボーディング向け)
+
+この章は、実装の背後にある最適化思想を保持するための要約です。`plan.md` を削除しても意図を失わないことを目的にしています。  
+各項目は `現状` (実装済み) と `方針` (拡張予定) を分けて記述します。
+
+### 1. CheckerResource 抽象化の意図
+
+- 現状:
+  - 実行エンジンは `claude -p` が中心。
+- 方針:
+  - チェッカーを「任意の CLI / API」を扱える抽象リソースとして定義し、モデル・価格・コンテキスト窓・レイテンシを同一軸で比較可能にする。
+  - 目的は、実装を特定ベンダーや単一 CLI に固定しないこと。
+
+### 2. バッチ化と検出精度のトレードオフ
+
+- 現状:
+  - config に `batching` フラグがあり、baseline と optimized で運用比較する。
+- 方針:
+  - バッチを大きくするとコストは下がるが見逃しリスクは上がる可能性がある。
+  - 採用判定は「F1 非劣化を満たしつつ wall_time / llm_calls が改善するか」で行う。
+
+### 3. 自己チューニングの考え方
+
+- 現状:
+  - ハーネスで static / dynamic / regression を計測し、設定差分の効果を比較する。
+- 方針:
+  - 例題生成 -> 設定候補評価 -> shadow/A-B 比較 -> 設定更新提案のループで、モデル・コンテキスト・バッチ構成を自動最適化する。
+
+### 4. ルール本文と適用設定の分離
+
+- 現状:
+  - ルールの本体は `rules/**/*.md` が正本。
+  - 運用設定は `tests/configs/*.json` で baseline/optimized を分離している。
+- 方針:
+  - 将来的には「what (ルール本文)」と「how (適用設定)」を明確分離し、設定のみの再学習・再配布を可能にする。
+
+### 5. 設定変更の監査
+
+- 現状:
+  - `tests/results/**/summary.json` に実行結果を残し、regression ファイルで差分を追跡する。
+- 方針:
+  - 自動チューニング導入時は decision 単位で理由・メトリクス・時刻を永続化し、設定変更の監査可能性を担保する。
+
+### 6. producer-consumer パイプラインの狙い
+
+- 現状:
+  - stream worker が結果を逐次出力し、consumer が `--list-violations` / `--claim` / `--resolve` で非同期処理する。
+- 方針:
+  - 「検出が全部終わるまで修正を待つ」直列フローを避け、検出と修正を重ねて壁時計時間を短縮する。
+
+### 7. fixpoint loop と振動対策 (拡張方針)
+
+- 現状:
+  - ファイル単位の検出・修正ループが中心。
+- 方針:
+  - 修正による新規 violation 連鎖を扱うため、反復上限付き fixpoint ループを導入する。
+  - 同一状態の再出現を cycle とみなし、振動時は自動修正を止めて manual review にエスカレーションする。
+
+### 8. cross-file ルール時の再チェック拡大 (拡張方針)
+
+- 現状:
+  - 実行単位は 1 ルール × 1 ファイル。
+- 方針:
+  - `cross_file` 属性を持つルールは、変更ファイルの逆引き依存を使って再チェック範囲を拡大し、取りこぼしを防ぐ。
+
+### 9. lock_on_satisfy の無効化とヒステリシス (拡張方針)
+
+- 現状:
+  - dynamic 評価では `lock_on_satisfy` により satisfied 状態を step 間保持する。
+  - 現行ハーネス実装は「一度 lock したら当該 run 中は解除しない」単純モデル (アンロックなし)。
+- 方針:
+  - ロック根拠部分に変更が重なった場合はアンロックする。
+  - ロック/アンロックの振動を避けるため、再ロックには連続 satisfied などのヒステリシス条件を置く。
+
+### 10. watch モードとバックプレッシャー (拡張方針)
+
+- 現状:
+  - stream モードはあるが watch の常時監視は未導入。
+- 方針:
+  - 連続変更時はデバウンス、キュー上限、低優先度の遅延再挿入で過負荷を制御する。
+  - 高 severity はドロップせず優先維持する。
+
+### 11. セキュリティ・データ保持方針
+
+- 現状:
+  - cache と stream 結果はローカル保存し、結果ディレクトリは世代数を制限する。
+- 方針:
+  - キャッシュ TTL、記録データの最小化、機密入力のサニタイズを標準化し、長期残存リスクを下げる。
+
+### 12. 設計採用の共通ゲート
+
+どの最適化案も次の条件を同時に満たす場合のみ採用する。
+
+- `F1` を劣化させない (回帰ゲート内)。
+- `wall_time` または `llm_calls` が改善する。
+- queue の一貫性 (CAS / lease / file lock) を壊さない。
+
+### 13. 実装済みと拡張方針の境界 (誤実装防止)
+
+次の区分を混同しないこと。
+
+- 実装済み:
+  - stream worker + queue claim/resolve (CAS/lease)
+  - F1 非劣化の regression ゲート
+  - baseline/optimized の別 run 比較
+- 方針 (未実装):
+  - fixpoint loop / 振動検出
+  - cross-file 再チェック拡大
+  - watch モードのデバウンス/バックプレッシャー
+  - decision 単位の設定変更監査ログ
+  - lock_on_satisfy のアンロック・ヒステリシス
+
+### 14. 誤解しやすいポイント (実装前に必読)
+
+1. `batching` / `context_level` / `cache` について
+- これらは現時点で `check_style.py` の実行経路を直接は変えない。
+- 設定ファイルに値があっても、コードがそのキーを参照していなければ機能は有効化されない。
+- したがって「値を変えただけで効いた」と解釈しない。効かせるには実装変更とハーネス再評価が必須。
+
+2. `lock_on_satisfy` について
+- 現行 dynamic ハーネスでは、同一 run 内で一度ロックされたルールは解除しない。
+- アンロックやヒステリシスは将来方針であり、現行挙動ではない。
+- 仕様変更する場合は、step 評価の期待値 (`expected_by_step`) も同時に更新する。
+
+3. `cross_file` 拡張について
+- 現行の基本実行単位とキャッシュ設計は 1 ルール × 1 ファイル前提。
+- `cross_file` を部分導入すると、再チェック範囲とキャッシュ整合性が破綻しやすい。
+- 導入時は再チェック範囲・キャッシュキー・回帰ハーネスをセットで変更する。
+
+### 15. 運用判断ケース集 (採用/不採用の具体例)
+
+以下は最適化提案を評価するための標準ケースです。判断は常に「F1 非劣化」「時間/コスト改善」「queue 一貫性維持」の3条件で行います。
+
+#### Case A: wall_time は改善するが見逃しが増える
+
+- 例: `wall_time -20%`, `llm_calls -10%`, ただし `F1` が回帰ゲート閾値を超えて低下
+- 判定: 不採用
+- 理由: `C_false_negative` の悪化を許容しない設計。速く安くなっても見逃し増加は却下する。
+
+#### Case B: 見逃しは増えないが時間もコストも改善しない
+
+- 例: `F1` 同等、`wall_time` 横ばい、`llm_calls` 横ばい
+- 判定: 原則不採用
+- 理由: 複雑性だけ増える変更を避ける。明確な改善がない最適化は導入しない。
+
+#### Case C: dynamic で false positive が減るが wall_time が悪化する
+
+- 例: 会議監視で `false_positives -50%`, `wall_time +15%`, `F1` は維持
+- 判定: 条件付き採用
+- 理由: dynamic では `C_disruption` の重みが高い。誤警告削減の価値が遅延悪化を上回る場合は採用する。
+- 条件: 遅延悪化が運用許容内であること、回帰ゲートを満たすこと。
+
+#### Case D: queue 排他を弱めることで速度向上を狙う
+
+- 例: file lock や CAS チェックを外してスループットを上げる提案
+- 判定: 不採用
+- 理由: queue 一貫性は必須制約。速度改善より競合破壊リスクが上回る。
+
+#### Case E: config 値だけで未実装機能を有効化したと主張する
+
+- 例: `batching/context_level/cache` の値変更のみで「最適化済み」と報告
+- 判定: 不採用
+- 理由: 現状これらは実行経路を直接切り替えない。実装変更とハーネス結果が伴わない主張は無効。
+
+#### Case F: cross_file を部分導入する小変更
+
+- 例: 一部ルールだけ cross_file を有効化し、キャッシュキーと再チェック範囲は据え置き
+- 判定: 不採用
+- 理由: 部分導入は整合性破綻を招く。再チェック範囲・キャッシュキー・回帰シナリオを同時更新できる変更のみ検討対象。

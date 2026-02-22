@@ -12,7 +12,13 @@ def print_summary(label: str, metrics: dict[str, float], timing: dict[str, float
     print(f"F1:        {metrics['f1']:.4f}")
     print(f"TP: {metrics['tp']} FP: {metrics['fp']} FN: {metrics['fn']} TN: {metrics['tn']}")
     if timing:
+        if timing.get("mode"):
+            print(f"Timing mode: {timing.get('mode')}")
         print(f"Wall clock time (s): {timing.get('wall_time', 0.0):.3f}")
+        if "wall_time_live_check" in timing:
+            print(f"Live check time (s): {timing.get('wall_time_live_check', 0.0):.3f}")
+        if "wall_time_recorded_replay" in timing:
+            print(f"Recorded replay time (s): {timing.get('wall_time_recorded_replay', 0.0):.3f}")
         print(f"LLM calls: {timing.get('llm_calls', 0)}")
     if call_counts:
         print(f"Cache hit: {call_counts.get('cache_hit', 0)}")
