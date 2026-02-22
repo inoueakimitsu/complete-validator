@@ -196,6 +196,7 @@ python3 scripts/check_style.py --full-scan --stream # ストリーム モード 
 python3 scripts/check_style.py --list-violations <stream-id> # queue の pending/in_progress 一覧
 python3 scripts/check_style.py --claim <stream-id> <violation-id> # violation を claim
 python3 scripts/check_style.py --resolve <stream-id> <violation-id> --claim-uuid <uuid> --state-version <n> # claim 済み violation を resolve
+python3 scripts/check_style.py --heartbeat <stream-id> <violation-id> --claim-uuid <uuid> --state-version <n> # in_progress claim の lease を延長
 python3 scripts/check_style.py --plugin-dir DIR    # プラグイン ディレクトリを指定 (組み込みルールの場所)
 ```
 
@@ -1046,6 +1047,7 @@ bash tests/update_recordings.sh
 
 - `--claim` は `claim_uuid` と `state_version` を発行し、`in_progress` に遷移する。
 - `--resolve` は `claim_uuid` と `state_version` が一致した場合のみ成功する。
+- `--heartbeat` は `claim_uuid` と `state_version` が一致した in-progress claim の `lease_expires_at` を更新する。
 - lease 期限を超えた `in_progress` は `pending` に回収される。
 - 同一 `target_file_path` で active claim がある場合、新規 claim は拒否する。
 

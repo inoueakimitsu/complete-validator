@@ -1575,16 +1575,23 @@ def parse_args() -> argparse.Namespace:
         help="violation を resolved に更新します。<stream-id> <violation-id> を指定します。",
     )
     parser.add_argument(
+        "--heartbeat",
+        metavar=("STREAM_ID", "VIOLATION_ID"),
+        nargs=2,
+        default=None,
+        help="claim 済み violation の lease を延長します。<stream-id> <violation-id> を指定します。",
+    )
+    parser.add_argument(
         "--claim-uuid",
         type=str,
         default=None,
-        help="--resolve 時の CAS 用 claim_uuid。",
+        help="--resolve/--heartbeat 時の CAS 用 claim_uuid。",
     )
     parser.add_argument(
         "--state-version",
         type=int,
         default=None,
-        help="--resolve 時の CAS 用 state_version。",
+        help="--resolve/--heartbeat 時の CAS 用 state_version。",
     )
     parser.add_argument(
         "--owner",
@@ -1597,6 +1604,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_LEASE_TTL_SECONDS,
         help="--claim 時の lease 秒数。",
+    )
+    parser.add_argument(
+        "--heartbeat-lease-ttl",
+        type=int,
+        default=None,
+        help="--heartbeat 時に更新する lease 秒数。未指定時は現行 lease_ttl を再利用します。",
     )
     return parser.parse_args()
 
@@ -2136,6 +2149,123 @@ def handle_resolve(args: argparse.Namespace) -> None:
     sys.exit(0)
 
 
+def handle_heartbeat(args: argparse.Namespace) -> None:
+    """claim 済み violation の lease を延長します。"""
+    stream_id, violation_id = args.heartbeat
+    if not stream_id or not violation_id:
+        print(
+            json.dumps(
+                {"ok": False, "error": "--heartbeat requires <stream-id> <violation-id>"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not args.claim_uuid:
+        print(
+            json.dumps(
+                {"ok": False, "error": "--heartbeat requires --claim-uuid"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    root = _repository_root()
+    _, queue_dir = _violations_dir(root)
+    if not queue_dir.exists():
+        print(json.dumps({"ok": False, "error": "queue directory not found"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    now_ts = _now_timestamp()
+    _force_expired_to_pending(queue_dir, now_ts)
+
+    candidates = _list_queue_states(
+        queue_dir,
+        stream_id=stream_id,
+        violation_id=violation_id,
+        statuses={ViolationStatus.IN_PROGRESS},
+    )
+    if not candidates:
+        print(
+            json.dumps(
+                {"ok": False, "error": "target in_progress violation not found"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    state_path, state, priority, _status = candidates[0]
+    if state.get("claim_uuid") != args.claim_uuid:
+        print(
+            json.dumps({"ok": False, "error": "claim_uuid mismatch"}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.state_version is not None and state.get("state_version") != args.state_version:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "state_version mismatch",
+                    "expected": args.state_version,
+                    "actual": state.get("state_version"),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if _is_lease_expired(state, now_ts):
+        print(
+            json.dumps({"ok": False, "error": "lease already expired"}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    current_ttl = state.get("lease_ttl")
+    if isinstance(current_ttl, int) and current_ttl > 0:
+        lease_ttl = current_ttl
+    else:
+        lease_ttl = DEFAULT_LEASE_TTL_SECONDS
+    if args.heartbeat_lease_ttl is not None and args.heartbeat_lease_ttl > 0:
+        lease_ttl = args.heartbeat_lease_ttl
+
+    next_state = dict(state)
+    next_state["lease_ttl"] = lease_ttl
+    next_state["lease_expires_at"] = now_ts + lease_ttl
+    next_state["state_version"] = int(state.get("state_version", 0)) + 1
+    next_state["updated_at"] = _now_iso8601()
+
+    target_path = _queue_state_path(queue_dir, violation_id, ViolationStatus.IN_PROGRESS, priority)
+    if not _replace_state_file(state_path, target_path, next_state):
+        print(
+            json.dumps({"ok": False, "error": "failed to heartbeat due concurrent update"}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "stream_id": stream_id,
+                "violation_id": violation_id,
+                "status": ViolationStatus.IN_PROGRESS.value,
+                "state_version": next_state.get("state_version", 0),
+                "claim_uuid": next_state.get("claim_uuid"),
+                "lease_ttl": lease_ttl,
+                "lease_expires_at": next_state.get("lease_expires_at"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    sys.exit(0)
+
+
 def format_and_output(
     results: list[tuple[str, str, str]],
     warnings: list[str],
@@ -2324,6 +2454,9 @@ def main() -> None:
         return
     if args.resolve is not None:
         handle_resolve(args)
+        return
+    if args.heartbeat is not None:
+        handle_heartbeat(args)
         return
 
     # ストリーム モード: バックグラウンド ワーカーを起動して stream-id を出力します。
