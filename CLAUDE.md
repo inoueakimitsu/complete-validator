@@ -1141,6 +1141,7 @@ dynamic fixture では、最終状態だけでなく途中経過も仕様です�
 
 - `scripts/check_style.py` が現在直接参照する config キーは `default_model` / `max_workers` / `cache_ttl_seconds`。
 - `scripts/check_style.py` は `.complete-validator/rule-config.json` を常時読み込みし、未設定時は `{"version":1,"rules":{},"decision_log":[]}` にフォールバックする。
+- `cross_file: true` かつ `dependency_scope: "python_imports"` のルールは、変更ファイルに依存する Python ファイルまで再チェック対象を拡張する。
 - `batching` / `context_level` / `cache` は、現時点では「運用プロファイルとハーネス比較の意味づけ」に使うキーであり、バリデータ本体の実行経路を直接切り替える仕様としては未実装。
 - `tests/test_harness.py` は 2 config 比較時に shadow 比較結果 (`shadow_<scenario>__<current>_vs_<candidate>.json`) を保存する。これは A/B 比較の最小実装で、設定の自動反映は行わない。
 - したがって、この3キーを変更しても `check_style.py` の実行ロジック自体は自動では変わらない。意味を持たせる場合は実装変更を伴う。
@@ -1229,12 +1230,14 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
   - `state_signature` の粒度改善 (ファイル内容ハッシュ等) と cycle 判定精度を高める。
   - 振動時の自動エスカレーション先 (manual review queue) を本体に統合する。
 
-### 8. cross-file ルール時の再チェック拡大 (拡張方針)
+### 8. cross-file ルール時の再チェック拡大
 
 - 現状:
   - 実行単位は 1 ルール × 1 ファイル。
-- 方針:
-  - `cross_file` 属性を持つルールは、変更ファイルの逆引き依存を使って再チェック範囲を拡大し、取りこぼしを防ぐ。
+  - ただし `cross_file: true` + `dependency_scope: "python_imports"` を指定したルールは、変更ファイルから Python import 逆引き依存をたどって再チェック範囲を拡張する。
+- 未実装:
+  - `python_imports` 以外の dependency scope (例: TS project reference 連鎖)。
+  - 言語横断の依存解決と重み付き優先度制御。
 
 ### 9. lock_on_satisfy の無効化とヒステリシス (拡張方針)
 

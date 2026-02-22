@@ -14,6 +14,7 @@ rules/*.md に定義されたルールに基づいてファイルを検証しま
 """
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -52,7 +53,7 @@ class ViolationStatus(str, Enum):
     STALE = "stale"
 
 # (rule_filename, glob_patterns, body) のリストです。
-RuleList = list[tuple[str, list[str], str]]
+RuleList = list[tuple[str, list[str], str, dict]]
 
 # claude -p の応答待ち上限です。ルール 1 つあたりの処理時間に余裕を持たせた値です。
 CLAUDE_TIMEOUT_SECONDS = 580
@@ -1265,9 +1266,14 @@ def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
         if isinstance(patterns, str):
             patterns = [patterns]
 
+        rule_options = {
+            "cross_file": bool(frontmatter.get("cross_file", False)),
+            "dependency_scope": str(frontmatter.get("dependency_scope", "")).strip().lower(),
+        }
+
         # ディレクトリ相対パスをルール名として使用します (例: readable_code/02_naming.md)。
         relative_name = str(md_file.relative_to(rules_dir))
-        rules.append((relative_name, patterns, body))
+        rules.append((relative_name, patterns, body, rule_options))
 
     return rules, warnings
 
@@ -1316,12 +1322,12 @@ def merge_rules(
     if builtin_dir is not None:
         sources.append(builtin_dir)
 
-    merged: dict[str, tuple[str, list[str], str]] = {}
+    merged: dict[str, tuple[str, list[str], str, dict]] = {}
     for rules_dir in reversed(sources):
         rules, warnings = load_rules_from_dir(rules_dir)
         all_warnings.extend(warnings)
-        for name, patterns, body in rules:
-            merged[name] = (name, patterns, body)
+        for name, patterns, body, rule_options in rules:
+            merged[name] = (name, patterns, body, rule_options)
 
     return list(merged.values()), all_warnings
 
@@ -1369,10 +1375,152 @@ def any_file_matches_rules(rules: RuleList, file_paths: list[str]) -> bool:
     """
     for file_path in file_paths:
         filename = os.path.basename(file_path)
-        for _rule_name, patterns, _body in rules:
+        for _rule_name, patterns, _body, _rule_options in rules:
             if any(fnmatch(filename, pat) for pat in patterns):
                 return True
     return False
+
+
+def _module_name_from_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    if normalized.endswith(".py"):
+        normalized = normalized[:-3]
+    if normalized.endswith("/__init__"):
+        normalized = normalized[: -len("/__init__")]
+    return normalized.replace("/", ".").strip(".")
+
+
+def _resolve_relative_module(current_module: str, imported_module: str | None, level: int) -> str | None:
+    if level <= 0:
+        return imported_module
+    current_parts = current_module.split(".") if current_module else []
+    if level > len(current_parts):
+        return None
+    base = current_parts[: len(current_parts) - level]
+    if imported_module:
+        return ".".join(base + imported_module.split("."))
+    return ".".join(base)
+
+
+def build_reverse_python_import_map(file_contents: dict[str, str]) -> dict[str, set[str]]:
+    """Python import から reverse dependency map (imported -> importers) を構築します。"""
+    module_to_path: dict[str, str] = {}
+    for path in file_contents.keys():
+        if not path.endswith(".py"):
+            continue
+        module = _module_name_from_path(path)
+        if module:
+            module_to_path[module] = path
+
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for importer_path, content in file_contents.items():
+        if not importer_path.endswith(".py"):
+            continue
+        importer_module = _module_name_from_path(importer_path)
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            continue
+
+        imported_modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level and node.level > 0:
+                    resolved = _resolve_relative_module(importer_module, node.module, node.level)
+                    if resolved:
+                        imported_modules.add(resolved)
+                        if node.module is None:
+                            for alias in node.names:
+                                imported_modules.add(f"{resolved}.{alias.name}")
+                elif node.module:
+                    imported_modules.add(node.module)
+
+        for module_name in imported_modules:
+            candidate = module_name
+            while candidate:
+                imported_path = module_to_path.get(candidate)
+                if imported_path:
+                    reverse[imported_path].add(importer_path)
+                    break
+                if "." not in candidate:
+                    break
+                candidate = candidate.rsplit(".", 1)[0]
+
+    return reverse
+
+
+def expand_reverse_dependencies(changed_files: set[str], reverse_map: dict[str, set[str]]) -> set[str]:
+    """reverse dependency map を使って、変更ファイルに依存するファイル集合を返します。"""
+    impacted = set(changed_files)
+    queue = list(changed_files)
+    while queue:
+        current = queue.pop(0)
+        for dependent in reverse_map.get(current, set()):
+            if dependent in impacted:
+                continue
+            impacted.add(dependent)
+            queue.append(dependent)
+    return impacted
+
+
+def resolve_cross_file_targets(
+    rules: RuleList,
+    target_files: list[str],
+    staged: bool,
+    full_scan: bool,
+) -> set[str]:
+    """cross_file ルール向けに再チェック対象を拡張します。"""
+    if full_scan:
+        return set(target_files)
+
+    has_python_cross_file = any(
+        bool(options.get("cross_file"))
+        and (str(options.get("dependency_scope", "")).strip().lower() in ("", "python_imports"))
+        for _name, _patterns, _body, options in rules
+    )
+    if not has_python_cross_file:
+        return set(target_files)
+
+    tracked_files = get_all_tracked_files()
+    python_files = [p for p in tracked_files if p.endswith(".py")]
+    if not python_files:
+        return set(target_files)
+
+    contents: dict[str, str] = {}
+    for path in python_files:
+        try:
+            if staged:
+                text = run_git("show", f":{path}")
+                if not text:
+                    text = Path(path).read_text(encoding="utf-8")
+            else:
+                text = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        contents[path] = text
+
+    reverse_map = build_reverse_python_import_map(contents)
+    changed_python = {p for p in target_files if p.endswith(".py")}
+    impacted = expand_reverse_dependencies(changed_python, reverse_map)
+    return set(target_files) | impacted
+
+
+def _rule_target_pool(
+    rule_options: dict,
+    target_files: list[str],
+    cross_file_targets: set[str] | None,
+) -> list[str]:
+    if not cross_file_targets:
+        return target_files
+    if not bool(rule_options.get("cross_file", False)):
+        return target_files
+    scope = str(rule_options.get("dependency_scope", "")).strip().lower()
+    if scope not in ("", "python_imports"):
+        return target_files
+    return sorted(cross_file_targets)
 
 
 def load_suppressions(base_dir: Path) -> str:
@@ -1915,6 +2063,7 @@ def run_parallel_checks(
     full_scan: bool,
     max_workers: int = DEFAULT_MAX_WORKERS,
     model: str = DEFAULT_MODEL,
+    cross_file_targets: set[str] | None = None,
 ) -> list[tuple[str, str, str]]:
     """per-file 単位でルール チェックを並列実行し、結果を収集します。
 
@@ -1951,8 +2100,9 @@ def run_parallel_checks(
 
     # (rule_name, rule_body, file_path) のペアを列挙します。
     units: list[tuple[str, str, str]] = []
-    for rule_name, rule_patterns, rule_body in rules:
-        matched = files_matching_patterns(rule_patterns, target_files)
+    for rule_name, rule_patterns, rule_body, rule_options in rules:
+        file_pool = _rule_target_pool(rule_options, target_files, cross_file_targets)
+        matched = files_matching_patterns(rule_patterns, file_pool)
         matched = [fp for fp in matched if fp in files]
         for fp in matched:
             units.append((rule_name, rule_body, fp))
@@ -2023,6 +2173,7 @@ def run_stream_checks(
     max_workers: int = DEFAULT_MAX_WORKERS,
     model: str = DEFAULT_MODEL,
     stream_id: str = "",
+    cross_file_targets: set[str] | None = None,
 ) -> None:
     """per-file 単位でルール チェックを並列実行し、結果をディスクに書き出します。
 
@@ -2058,8 +2209,9 @@ def run_stream_checks(
 
     # (rule_name, rule_body, file_path) のペアを列挙します。
     units: list[tuple[str, str, str]] = []
-    for rule_name, rule_patterns, rule_body in rules:
-        matched = files_matching_patterns(rule_patterns, target_files)
+    for rule_name, rule_patterns, rule_body, rule_options in rules:
+        file_pool = _rule_target_pool(rule_options, target_files, cross_file_targets)
+        matched = files_matching_patterns(rule_patterns, file_pool)
         matched = [fp for fp in matched if fp in files]
         for fp in matched:
             units.append((rule_name, rule_body, fp))
@@ -2631,6 +2783,13 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         tracker.mark_completed()
         return
 
+    cross_file_targets = resolve_cross_file_targets(
+        rules=rules,
+        target_files=target_files,
+        staged=staged,
+        full_scan=full_scan,
+    )
+
     config = load_config(cache_dir)
     _rule_config = load_rule_config(cache_dir)
     suppressions = load_suppressions(cache_dir)
@@ -2644,9 +2803,19 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         fp for fp in target_files
         if any(
             any(fnmatch(os.path.basename(fp), pat) for pat in patterns)
-            for _name, patterns, _body in rules
+            for _name, patterns, _body, _rule_options in rules
         )
     ]
+    if cross_file_targets:
+        for fp in sorted(cross_file_targets):
+            if fp in matched_target_files:
+                continue
+            if any(
+                any(fnmatch(os.path.basename(fp), pat) for pat in patterns)
+                and bool(rule_options.get("cross_file", False))
+                for _name, patterns, _body, rule_options in rules
+            ):
+                matched_target_files.append(fp)
     files = load_file_contents(matched_target_files, staged, full_scan)
     if not files:
         tracker = StreamStatusTracker(results_dir=results_dir, total_units=0)
@@ -2662,6 +2831,7 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         max_workers=max_workers,
         model=default_model,
         stream_id=stream_id,
+        cross_file_targets=cross_file_targets,
     )
 
 
@@ -2724,6 +2894,13 @@ def main() -> None:
         sys.exit(0)
 
     # ファイル内容を読み込みます。
+    cross_file_targets = resolve_cross_file_targets(
+        rules=rules,
+        target_files=target_files,
+        staged=staged,
+        full_scan=full_scan,
+    )
+
     config = load_config(cache_dir)
     _rule_config = load_rule_config(cache_dir)
     suppressions = load_suppressions(cache_dir)
@@ -2738,9 +2915,19 @@ def main() -> None:
         file_path for file_path in target_files
         if any(
             any(fnmatch(os.path.basename(file_path), pat) for pat in patterns)
-            for _name, patterns, _body in rules
+            for _name, patterns, _body, _rule_options in rules
         )
     ]
+    if cross_file_targets:
+        for file_path in sorted(cross_file_targets):
+            if file_path in matched_target_files:
+                continue
+            if any(
+                any(fnmatch(os.path.basename(file_path), pat) for pat in patterns)
+                and bool(rule_options.get("cross_file", False))
+                for _name, patterns, _body, rule_options in rules
+            ):
+                matched_target_files.append(file_path)
     files = load_file_contents(matched_target_files, staged, full_scan)
 
     if not files:
@@ -2753,6 +2940,7 @@ def main() -> None:
         rules, target_files, files, diff_chunks, suppressions, cache, full_scan,
         max_workers=max_workers,
         model=default_model,
+        cross_file_targets=cross_file_targets,
     )
     format_and_output(results, warnings, full_scan)
 
