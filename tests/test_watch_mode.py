@@ -60,6 +60,7 @@ def test_run_watch_mode_triggers_once_and_stops(monkeypatch):
         watch_max_runs=1,
         watch_queue_max=8,
         watch_reinsert_delay_seconds=2.0,
+        watch_history_ttl_seconds=3600,
         stream=False,
         stream_worker=False,
     )
@@ -82,6 +83,7 @@ def test_run_watch_mode_triggers_once_and_stops(monkeypatch):
 
     monkeypatch.setattr(check_style, "resolve_target_files", fake_resolve_target_files)
     monkeypatch.setattr(check_style.subprocess, "run", fake_run)
+    monkeypatch.setattr(check_style, "_update_watch_priority_stats", lambda root, target_files, priority: None)
     monkeypatch.setattr(check_style.time, "sleep", lambda _x: None)
     monkeypatch.setattr(check_style.time, "monotonic", lambda: 1.0)
 
@@ -102,6 +104,7 @@ def test_run_watch_mode_rejects_full_scan():
         watch_max_runs=1,
         watch_queue_max=8,
         watch_reinsert_delay_seconds=2.0,
+        watch_history_ttl_seconds=3600,
         stream=False,
         stream_worker=False,
     )
@@ -312,4 +315,64 @@ def test_watch_priority_from_recent_queue_returns_normal_without_matches(tmp_pat
     )
 
     priority = check_style._watch_priority_from_recent_queue(tmp_path, ["notes.md"])
+    assert priority == check_style.WATCH_PRIORITY_NORMAL
+
+
+def test_watch_priority_from_history_stats_uses_recent_record(tmp_path):
+    check_style = _load_check_style_module()
+    now = 1_700_000_000.0
+    check_style._save_watch_priority_stats(
+        tmp_path,
+        {
+            "version": 1,
+            "files": {
+                "notes.md": {
+                    "last_priority": check_style.WATCH_PRIORITY_HIGH,
+                    "last_seen_at": now - 10.0,
+                    "seen_count": 3,
+                }
+            },
+        },
+    )
+
+    original_time = check_style.time.time
+    check_style.time.time = lambda: now
+    try:
+        priority = check_style._watch_priority_from_history_stats(
+            tmp_path,
+            ["notes.md"],
+            ttl_seconds=3600,
+        )
+    finally:
+        check_style.time.time = original_time
+    assert priority == check_style.WATCH_PRIORITY_HIGH
+
+
+def test_watch_priority_from_history_stats_ignores_expired_record(tmp_path):
+    check_style = _load_check_style_module()
+    now = 1_700_000_000.0
+    check_style._save_watch_priority_stats(
+        tmp_path,
+        {
+            "version": 1,
+            "files": {
+                "notes.md": {
+                    "last_priority": check_style.WATCH_PRIORITY_HIGH,
+                    "last_seen_at": now - 4000.0,
+                    "seen_count": 3,
+                }
+            },
+        },
+    )
+
+    original_time = check_style.time.time
+    check_style.time.time = lambda: now
+    try:
+        priority = check_style._watch_priority_from_history_stats(
+            tmp_path,
+            ["notes.md"],
+            ttl_seconds=3600,
+        )
+    finally:
+        check_style.time.time = original_time
     assert priority == check_style.WATCH_PRIORITY_NORMAL

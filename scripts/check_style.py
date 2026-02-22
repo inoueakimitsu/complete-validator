@@ -78,6 +78,7 @@ DEFAULT_WATCH_INTERVAL_SECONDS = 1.0
 DEFAULT_WATCH_DEBOUNCE_SECONDS = 0.5
 DEFAULT_WATCH_QUEUE_MAX = 8
 DEFAULT_WATCH_REINSERT_DELAY_SECONDS = 2.0
+DEFAULT_WATCH_HISTORY_TTL_SECONDS = 3600
 WATCH_PRIORITY_HIGH = 0
 WATCH_PRIORITY_MEDIUM = 1
 WATCH_PRIORITY_NORMAL = 2
@@ -2079,6 +2080,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_WATCH_REINSERT_DELAY_SECONDS,
         help="キューあふれ時に退避したシグネチャを再挿入するまでの遅延 (秒)。",
     )
+    parser.add_argument(
+        "--watch-history-ttl-seconds",
+        type=int,
+        default=DEFAULT_WATCH_HISTORY_TTL_SECONDS,
+        help="watch 優先度履歴を参照する有効期間 (秒)。",
+    )
     return parser.parse_args()
 
 
@@ -2161,6 +2168,72 @@ def _watch_priority_from_recent_queue(root: Path, target_files: list[str]) -> in
             if best == WATCH_PRIORITY_HIGH:
                 return best
     return best
+
+
+def _watch_priority_stats_path(root: Path) -> Path:
+    return root / ".complete-validator" / "watch-priority-stats.json"
+
+
+def _load_watch_priority_stats(root: Path) -> dict:
+    path = _watch_priority_stats_path(root)
+    if not path.exists():
+        return {"version": 1, "files": {}}
+    raw = _read_json_file(path)
+    if not isinstance(raw, dict):
+        return {"version": 1, "files": {}}
+    files = raw.get("files")
+    if not isinstance(files, dict):
+        files = {}
+    return {"version": int(raw.get("version", 1)), "files": files}
+
+
+def _save_watch_priority_stats(root: Path, stats: dict) -> None:
+    path = _watch_priority_stats_path(root)
+    _write_json_atomically(path, stats)
+
+
+def _watch_priority_from_history_stats(root: Path, target_files: list[str], ttl_seconds: int) -> int:
+    if not target_files:
+        return WATCH_PRIORITY_NORMAL
+    stats = _load_watch_priority_stats(root)
+    files = stats.get("files", {})
+    if not isinstance(files, dict):
+        return WATCH_PRIORITY_NORMAL
+    now = time.time()
+    best = WATCH_PRIORITY_NORMAL
+    for path in target_files:
+        entry = files.get(path)
+        if not isinstance(entry, dict):
+            continue
+        last_seen = float(entry.get("last_seen_at", 0.0))
+        if ttl_seconds > 0 and (now - last_seen) > ttl_seconds:
+            continue
+        last_priority = int(entry.get("last_priority", WATCH_PRIORITY_NORMAL))
+        if last_priority < best:
+            best = last_priority
+            if best == WATCH_PRIORITY_HIGH:
+                return best
+    return best
+
+
+def _update_watch_priority_stats(root: Path, target_files: list[str], priority: int) -> None:
+    if not target_files:
+        return
+    stats = _load_watch_priority_stats(root)
+    files = stats.get("files", {})
+    if not isinstance(files, dict):
+        files = {}
+    now = time.time()
+    for path in target_files:
+        entry = files.get(path, {})
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["last_priority"] = int(priority)
+        entry["last_seen_at"] = now
+        entry["seen_count"] = int(entry.get("seen_count", 0)) + 1
+        files[path] = entry
+    stats["files"] = files
+    _save_watch_priority_stats(root, stats)
 
 
 def build_watch_check_command(args: argparse.Namespace) -> list[str]:
@@ -2270,6 +2343,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     max_runs = int(args.watch_max_runs) if int(args.watch_max_runs) > 0 else 0
     queue_max = max(1, int(args.watch_queue_max))
     reinsert_delay = max(0.1, float(args.watch_reinsert_delay_seconds))
+    history_ttl = max(0, int(args.watch_history_ttl_seconds))
 
     command = build_watch_check_command(args)
     root = _repository_root()
@@ -2288,7 +2362,9 @@ def run_watch_mode(args: argparse.Namespace) -> None:
             _watch_priority_from_diff(diff_chunks),
             _watch_priority_from_rule_severity(target_files, rules),
             _watch_priority_from_recent_queue(root, target_files),
+            _watch_priority_from_history_stats(root, target_files, history_ttl),
         )
+        _update_watch_priority_stats(root, target_files, current_priority)
         now = time.monotonic()
         _watch_restore_delayed_signatures(pending_queue, delayed_queue, now, queue_max)
         _watch_enqueue_signature(
