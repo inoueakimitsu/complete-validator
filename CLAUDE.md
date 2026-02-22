@@ -283,6 +283,7 @@ mkdir -p .complete-validator/rules
 
 - 先頭に YAML フロント マターで `applies_to` を指定します (必須)
 - `applies_to` にはファイル名の glob パターンのリストを指定します
+  - インライン配列 (`applies_to: ["*.py"]`) と YAML リスト形式の両方をサポートします
 - `## ` 見出しでルールを区切ります
 - 各ルールにルール名、説明、Bad/Good の具体例を記載します
 - 複数ファイルに分割できます (例: `rules/python_style.md`、`rules/naming.md`)
@@ -304,6 +305,16 @@ applies_to: ["*.py"]
 applies_to: ["*.py", "*.md"]
 ---
 # Japanese Comment Style Rules
+...
+```
+
+```markdown
+---
+applies_to:
+  - "*.txt"
+  - "*.md"
+---
+# Text Rules
 ...
 ```
 

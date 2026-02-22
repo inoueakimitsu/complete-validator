@@ -1268,20 +1268,55 @@ def parse_frontmatter(content: str) -> tuple[dict | None, str]:
     raw = match.group(1).strip()
     body = content[match.end():]
 
-    frontmatter = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        key_value = line.split(":", 1)
-        if len(key_value) != 2:
-            continue
-        key = key_value[0].strip()
-        value = key_value[1].strip()
+    def _parse_scalar(value: str):
+        trimmed = value.strip()
+        if trimmed == "":
+            return ""
         try:
-            frontmatter[key] = json.loads(value)
+            return json.loads(trimmed)
         except json.JSONDecodeError:
-            frontmatter[key] = value
+            lowered = trimmed.lower()
+            if lowered in {"true", "false"}:
+                return lowered == "true"
+            return trimmed.strip("\"'")
+
+    lines = raw.splitlines()
+    frontmatter = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or ":" not in stripped:
+            i += 1
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if value != "":
+            frontmatter[key] = _parse_scalar(value)
+            i += 1
+            continue
+
+        # YAML 風リスト (例: applies_to:\n  - "*.py")
+        items = []
+        j = i + 1
+        while j < len(lines):
+            next_line = lines[j]
+            next_stripped = next_line.strip()
+            if not next_stripped:
+                j += 1
+                continue
+            if not next_line.startswith((" ", "\t")):
+                break
+            if next_stripped.startswith("-"):
+                item_text = next_stripped[1:].strip()
+                items.append(_parse_scalar(item_text))
+                j += 1
+                continue
+            break
+        frontmatter[key] = items if items else ""
+        i = j
 
     return frontmatter, body
 

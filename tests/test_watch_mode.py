@@ -518,3 +518,22 @@ def test_update_watch_priority_stats_resets_trend_window_after_timeout(tmp_path)
     entry = stats["files"]["notes.md"]
     assert entry["trend_seen_count"] == 1
     assert entry["trend_window_started_at"] == base_now
+
+
+def test_parse_frontmatter_supports_yaml_list_applies_to():
+    check_style = _load_check_style_module()
+    content = (
+        "---\n"
+        "applies_to:\n"
+        "  - \"*.txt\"\n"
+        "  - \"*.md\"\n"
+        "severity: high\n"
+        "---\n"
+        "# Rule body\n"
+    )
+    frontmatter, body = check_style.parse_frontmatter(content)
+
+    assert isinstance(frontmatter, dict)
+    assert frontmatter["applies_to"] == ["*.txt", "*.md"]
+    assert frontmatter["severity"] == "high"
+    assert body.strip() == "# Rule body"
