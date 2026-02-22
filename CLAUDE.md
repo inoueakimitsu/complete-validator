@@ -325,7 +325,8 @@ applies_to: ["*.py", "*.md"]
 ```json
 {
   "max_workers": 4,
-  "default_model": "sonnet"
+  "default_model": "sonnet",
+  "cache_ttl_seconds": 604800
 }
 ```
 
@@ -333,8 +334,30 @@ applies_to: ["*.py", "*.md"]
 |---|---|---|---|
 | `max_workers` | int | 4 | `claude -p` の同時起動数の上限。大きくすると高速になるがメモリ消費が増加します。`claude -p` は 1 プロセスあたり 200-400MB のメモリを消費するため、環境に合わせて調整してください。 |
 | `default_model` | str | sonnet | `claude -p` で使用するデフォルト モデルです。エイリアス (`sonnet`, `haiku` など) またはフルネーム (`claude-sonnet-4-5-20250929` など) を指定できます。 |
+| `cache_ttl_seconds` | int | 604800 | キャッシュ有効期限 (秒)。期限切れエントリは読込/参照時に自動除去されます。 |
 
 ファイルが存在しない場合はデフォルト値が使用されます。
+
+## 設定ファイル (rule-config.json)
+
+自己チューニング用の適用設定は `.complete-validator/rule-config.json` に分離します。  
+このファイルは `scripts/check_style.py` から常時読み込みされ、未作成・破損時は安全にフォールバックします。
+
+```json
+{
+  "version": 1,
+  "rules": {},
+  "decision_log": []
+}
+```
+
+| キー | 型 | 説明 |
+|---|---|---|
+| `version` | int | スキーマ バージョン。 |
+| `rules` | object | ルールごとの適用設定 (`what` と分離された `how`)。 |
+| `decision_log` | array | 設定変更の履歴 (監査用途)。 |
+
+環境変数 `RULE_VALIDATOR_RULE_CONFIG_PATH` で保存先を明示指定できます。
 
 ## 偽陽性の抑制 (suppressions)
 
@@ -437,6 +460,7 @@ python3 tests/test_harness.py --scenario dynamic --config tests/configs/baseline
 
 # 比較 (baseline vs optimized)
 python3 tests/test_harness.py --scenario static --config tests/configs/baseline.json tests/configs/optimized.json
+# 出力: tests/results/shadow_static__baseline_vs_optimized.json
 
 # 直近 2 結果の regression 比較
 python3 tests/test_harness.py --scenario regression
@@ -1114,8 +1138,10 @@ dynamic fixture では、最終状態だけでなく途中経過も仕様です�
 
 重要:
 
-- `scripts/check_style.py` が現在直接参照する config キーは `default_model` と `max_workers`。
+- `scripts/check_style.py` が現在直接参照する config キーは `default_model` / `max_workers` / `cache_ttl_seconds`。
+- `scripts/check_style.py` は `.complete-validator/rule-config.json` を常時読み込みし、未設定時は `{"version":1,"rules":{},"decision_log":[]}` にフォールバックする。
 - `batching` / `context_level` / `cache` は、現時点では「運用プロファイルとハーネス比較の意味づけ」に使うキーであり、バリデータ本体の実行経路を直接切り替える仕様としては未実装。
+- `tests/test_harness.py` は 2 config 比較時に shadow 比較結果 (`shadow_<scenario>__<current>_vs_<candidate>.json`) を保存する。これは A/B 比較の最小実装で、設定の自動反映は行わない。
 - したがって、この3キーを変更しても `check_style.py` の実行ロジック自体は自動では変わらない。意味を持たせる場合は実装変更を伴う。
 
 ### 6. ゲートはローカルで即時再現できることを優先する

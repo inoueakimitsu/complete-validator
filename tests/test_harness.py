@@ -739,6 +739,48 @@ def print_and_persist(
     emit_summary(output, str(out_dir / "summary.json"))
 
 
+def persist_shadow_comparison(
+    root: Path,
+    scenario: str,
+    current_name: str,
+    current_metrics: dict[str, float],
+    current_timing: dict[str, float],
+    candidate_name: str,
+    candidate_metrics: dict[str, float],
+    candidate_timing: dict[str, float],
+) -> None:
+    f1_delta = float(candidate_metrics.get("f1", 0.0)) - float(current_metrics.get("f1", 0.0))
+    disruption_delta = float(candidate_metrics.get("disruption_rate", 0.0)) - float(
+        current_metrics.get("disruption_rate", 0.0)
+    )
+    wall_time_delta = float(candidate_timing.get("wall_time", 0.0)) - float(
+        current_timing.get("wall_time", 0.0)
+    )
+    llm_calls_delta = int(candidate_timing.get("llm_calls", 0)) - int(current_timing.get("llm_calls", 0))
+    payload = {
+        "scenario": "shadow",
+        "base_scenario": scenario,
+        "current": {
+            "config": current_name,
+            "metrics": current_metrics,
+            "timing": current_timing,
+        },
+        "candidate": {
+            "config": candidate_name,
+            "metrics": candidate_metrics,
+            "timing": candidate_timing,
+        },
+        "delta": {
+            "f1": f1_delta,
+            "disruption_rate": disruption_delta,
+            "wall_time": wall_time_delta,
+            "llm_calls": llm_calls_delta,
+        },
+    }
+    out_path = root / "tests" / "results" / f"shadow_{scenario}__{current_name}_vs_{candidate_name}.json"
+    emit_summary(payload, str(out_path))
+
+
 def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parent.parent
@@ -859,6 +901,16 @@ def main() -> None:
         opt_detail.get("timing", {}),
         opt_detail,
         root,
+    )
+    persist_shadow_comparison(
+        root=root,
+        scenario=args.scenario,
+        current_name=config_paths[0].stem,
+        current_metrics=baseline,
+        current_timing=base_detail.get("timing", {}),
+        candidate_name=config_paths[1].stem,
+        candidate_metrics=optimized,
+        candidate_timing=opt_detail.get("timing", {}),
     )
 
 
