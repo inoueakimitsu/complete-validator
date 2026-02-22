@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         help="stream timeout for dynamic fixtures",
     )
     parser.add_argument(
+        "--max-fixpoint-iterations",
+        type=int,
+        default=3,
+        help="maximum recheck iterations per dynamic step",
+    )
+    parser.add_argument(
         "--regression-max-drop",
         type=float,
         default=0.05,
@@ -443,6 +449,7 @@ def run_dynamic(
     runner_cfg: RunnerConfig,
     fixture_filter: list[str] | None,
     wait_seconds: int,
+    max_fixpoint_iterations: int = 3,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     fm = FixtureManager(runner_cfg.root / "tests" / "fixtures")
     dynamic_fixtures = fm.list_dynamic_fixtures(fixture_filter)
@@ -454,6 +461,8 @@ def run_dynamic(
     metrics_list = []
     all_rule_results: list[dict] = []
     total_ms = 0.0
+
+    iteration_cap = max(1, int(max_fixpoint_iterations))
 
     for fixture in dynamic_fixtures:
         work_dir = _init_fixture_repo(runner_cfg.root, fixture)
@@ -472,8 +481,23 @@ def run_dynamic(
                     handle.write(append_text)
 
                 stream_id, entries = _run_stream_once(work_dir, runner_cfg, plugin_dir, wait_seconds)
+                _claim_and_resolve_all(work_dir, runner_cfg, plugin_dir, stream_id, entries)
+
+                final_stream_id = stream_id
+                final_entries = entries
+                fixpoint_iterations = 1
+                while fixpoint_iterations < iteration_cap:
+                    has_deny = any(str(e.get("status", "allow")).lower() == "deny" for e in final_entries)
+                    if not has_deny:
+                        break
+                    next_stream_id, next_entries = _run_stream_once(work_dir, runner_cfg, plugin_dir, wait_seconds)
+                    _claim_and_resolve_all(work_dir, runner_cfg, plugin_dir, next_stream_id, next_entries)
+                    final_stream_id = next_stream_id
+                    final_entries = next_entries
+                    fixpoint_iterations += 1
+
                 step_no = int(step_item.get("step", 0))
-                result = _to_check_result(fixture.name, entries, stream_id)
+                result = _to_check_result(fixture.name, final_entries, final_stream_id)
 
                 for item in result.rule_results:
                     rule_name = str(item.get("rule", ""))
@@ -491,11 +515,11 @@ def run_dynamic(
                     {
                         "fixture": fixture.name,
                         "step": step_no,
-                        "stream_id": stream_id,
+                        "stream_id": final_stream_id,
+                        "fixpoint_iterations": fixpoint_iterations,
                         "rule_results": result.rule_results,
                     },
                 )
-                _claim_and_resolve_all(work_dir, runner_cfg, plugin_dir, stream_id, entries)
             total_ms += (time.perf_counter() - start_ms) * 1000.0
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -621,7 +645,12 @@ def main() -> None:
             check_script=root / "scripts" / "check_style.py",
             root=root,
         )
-        metrics, details = run_dynamic(runner_cfg, args.fixture, args.wait_seconds)
+        metrics, details = run_dynamic(
+            runner_cfg,
+            args.fixture,
+            args.wait_seconds,
+            max_fixpoint_iterations=args.max_fixpoint_iterations,
+        )
         print_and_persist(
             scenario=args.scenario,
             config_name=config_paths[0].stem,

@@ -432,6 +432,7 @@ python3 tests/test_harness.py --scenario static --config tests/configs/baseline.
 # dynamic シナリオ (stream + claim/resolve)
 python3 tests/test_harness.py --scenario dynamic --config tests/configs/baseline.json
 python3 tests/test_harness.py --scenario dynamic --config tests/configs/optimized.json
+python3 tests/test_harness.py --scenario dynamic --config tests/configs/baseline.json --max-fixpoint-iterations 3
 
 # 比較 (baseline vs optimized)
 python3 tests/test_harness.py --scenario static --config tests/configs/baseline.json tests/configs/optimized.json
@@ -458,6 +459,7 @@ bash tests/update_recordings.sh
 - `--recorded` は static 専用。録画が無い場合は失敗させる。
 - `No tracked files found.` を成功扱いにしない。fixture 側の Git 初期化不備として失敗させる。
 - dynamic 評価は `--list-violations` だけで判定しない。`stream-results/.../results/*.json` を一次ソースにする。
+- dynamic 評価は step ごとに fixpoint ループを回せる (`--max-fixpoint-iterations`, デフォルト 3)。
 - `lock_on_satisfy` 付きルールは step 間で satisfied 状態を保持して評価する。
 - baseline/optimized は別 config を必ず使い分ける。比較時に同一 config を再利用しない。
 - regression は scenario ごとに実行する: `static` と `dynamic` を分離。
@@ -1171,12 +1173,14 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
 - 方針:
   - 「検出が全部終わるまで修正を待つ」直列フローを避け、検出と修正を重ねて壁時計時間を短縮する。
 
-### 7. fixpoint loop と振動対策 (拡張方針)
+### 7. fixpoint loop と振動対策
 
 - 現状:
-  - ファイル単位の検出・修正ループが中心。
+  - dynamic ハーネスには反復上限付き fixpoint ループを実装済み。
+  - 各 step で `deny` が残る場合、`--max-fixpoint-iterations` 回まで再チェックを繰り返す。
+  - 実行結果には `fixpoint_iterations` を出力し、反復回数を追跡できる。
 - 方針:
-  - 修正による新規 violation 連鎖を扱うため、反復上限付き fixpoint ループを導入する。
+  - 振動検出 (`state signature`) と manual review 退避を追加し、収束しないループを自動停止する。
   - 同一状態の再出現を cycle とみなし、振動時は自動修正を止めて manual review にエスカレーションする。
 
 ### 8. cross-file ルール時の再チェック拡大 (拡張方針)
@@ -1226,8 +1230,9 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
   - stream worker + queue claim/resolve (CAS/lease)
   - F1 非劣化の regression ゲート
   - baseline/optimized の別 run 比較
+  - dynamic ハーネスの反復上限付き fixpoint ループ (`--max-fixpoint-iterations`)
 - 方針 (未実装):
-  - fixpoint loop / 振動検出
+  - 振動検出 (state signature) / manual review 退避
   - cross-file 再チェック拡大
   - watch モードのデバウンス/バックプレッシャー
   - decision 単位の設定変更監査ログ
