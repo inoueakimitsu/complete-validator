@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import keyword
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -191,17 +193,24 @@ def _apply_lock_unlock_by_change(
     locked_rules: set[str],
     deny_streaks: dict[str, int],
     unlock_on_change_keywords: dict[str, list[str]],
+    unlock_on_change_symbols: dict[str, list[str]],
 ) -> None:
     if not locked_rules:
         return
     changed = (append_text or "").lower()
     if not changed:
         return
+    changed_identifiers = {
+        token
+        for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", append_text or "")
+        if token and not keyword.iskeyword(token)
+    }
     for rule_name in list(locked_rules):
         keywords = unlock_on_change_keywords.get(rule_name, [])
-        if not keywords:
-            continue
-        if any(keyword in changed for keyword in keywords):
+        symbols = unlock_on_change_symbols.get(rule_name, [])
+        keyword_match = any(keyword in changed for keyword in keywords)
+        symbol_match = any(symbol in changed_identifiers for symbol in symbols)
+        if keyword_match or symbol_match:
             locked_rules.discard(rule_name)
             deny_streaks[rule_name] = 0
 
@@ -611,16 +620,22 @@ def run_dynamic(
             if isinstance(ann, dict) and ann.get("lock_on_satisfy")
         }
         unlock_on_change_keywords: dict[str, list[str]] = {}
+        unlock_on_change_symbols: dict[str, list[str]] = {}
         for ann in fixture.annotations:
             if not isinstance(ann, dict):
                 continue
             rule_name = str(ann.get("rule", ""))
             raw_keywords = ann.get("unlock_on_change_keywords", [])
+            raw_symbols = ann.get("unlock_on_change_symbols", [])
             if not rule_name or not isinstance(raw_keywords, list):
-                continue
-            normalized = [str(item).strip().lower() for item in raw_keywords if str(item).strip()]
-            if normalized:
-                unlock_on_change_keywords[rule_name] = normalized
+                raw_keywords = []
+            normalized_keywords = [str(item).strip().lower() for item in raw_keywords if str(item).strip()]
+            if normalized_keywords:
+                unlock_on_change_keywords[rule_name] = normalized_keywords
+            if isinstance(raw_symbols, list):
+                normalized_symbols = [str(item).strip() for item in raw_symbols if str(item).strip()]
+                if normalized_symbols:
+                    unlock_on_change_symbols[rule_name] = normalized_symbols
         locked_rules: set[str] = set()
         lock_deny_streaks: dict[str, int] = {}
         try:
@@ -634,6 +649,7 @@ def run_dynamic(
                     locked_rules=locked_rules,
                     deny_streaks=lock_deny_streaks,
                     unlock_on_change_keywords=unlock_on_change_keywords,
+                    unlock_on_change_symbols=unlock_on_change_symbols,
                 )
 
                 stream_id, entries = _run_stream_once(work_dir, runner_cfg, plugin_dir, wait_seconds)

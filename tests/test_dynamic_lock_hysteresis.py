@@ -87,6 +87,7 @@ def test_unlock_by_change_keyword_immediately_releases_lock():
         locked_rules=locked,
         deny_streaks=streaks,
         unlock_on_change_keywords=unlock_map,
+        unlock_on_change_symbols={},
     )
 
     assert "meeting_rules/security_discussion.md" not in locked
@@ -104,6 +105,41 @@ def test_unlock_by_change_keyword_does_not_unlock_when_unrelated_change():
         locked_rules=locked,
         deny_streaks=streaks,
         unlock_on_change_keywords=unlock_map,
+        unlock_on_change_symbols={},
+    )
+
+    assert "meeting_rules/security_discussion.md" in locked
+    assert streaks["meeting_rules/security_discussion.md"] == 1
+
+
+def test_unlock_by_change_symbol_releases_lock_when_identifier_matches():
+    harness = _load_test_harness_module()
+    locked = {"meeting_rules/security_discussion.md"}
+    streaks = {"meeting_rules/security_discussion.md": 1}
+
+    harness._apply_lock_unlock_by_change(
+        append_text="def validate_token(token):\n    return token.strip()",
+        locked_rules=locked,
+        deny_streaks=streaks,
+        unlock_on_change_keywords={},
+        unlock_on_change_symbols={"meeting_rules/security_discussion.md": ["validate_token"]},
+    )
+
+    assert "meeting_rules/security_discussion.md" not in locked
+    assert streaks["meeting_rules/security_discussion.md"] == 0
+
+
+def test_unlock_by_change_symbol_does_not_release_on_non_matching_identifier():
+    harness = _load_test_harness_module()
+    locked = {"meeting_rules/security_discussion.md"}
+    streaks = {"meeting_rules/security_discussion.md": 1}
+
+    harness._apply_lock_unlock_by_change(
+        append_text="def summarize_notes(text):\n    return text",
+        locked_rules=locked,
+        deny_streaks=streaks,
+        unlock_on_change_keywords={},
+        unlock_on_change_symbols={"meeting_rules/security_discussion.md": ["validate_token"]},
     )
 
     assert "meeting_rules/security_discussion.md" in locked
