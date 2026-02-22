@@ -70,6 +70,8 @@ STREAM_DEADLINE_SECONDS = 3600
 DEFAULT_MAX_WORKERS = 4
 # claude -p で使用するデフォルト モデルです。.complete-validator/config.json で上書きできます。
 DEFAULT_MODEL = "sonnet"
+# キャッシュ TTL のデフォルト (秒) です。既定は 7 日です。
+DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def load_config(config_dir: Path) -> dict:
@@ -137,6 +139,25 @@ def get_default_model(config: dict) -> str:
     return DEFAULT_MODEL
 
 
+def get_cache_ttl_seconds(config: dict) -> int:
+    """config から cache_ttl_seconds を取得します。未設定時は DEFAULT_CACHE_TTL_SECONDS を返します。
+
+    Parameters
+    ----------
+    config: dict
+        ``load_config()`` で読み込んだ設定の辞書です。
+
+    Returns
+    -------
+    int
+        キャッシュ TTL (秒) です。
+    """
+    value = config.get("cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS)
+    if isinstance(value, int) and value > 0:
+        return value
+    return DEFAULT_CACHE_TTL_SECONDS
+
+
 @dataclass
 class CacheStore:
     """JSON ファイルに永続化されるキャッシュ ストアです。
@@ -148,19 +169,88 @@ class CacheStore:
     """
 
     path: Path
+    ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS
     _data: dict = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def _current_ts(self) -> float:
+        return time.time()
+
+    def _is_expired(self, entry: dict, now_ts: float) -> bool:
+        expires_at = entry.get("expires_at")
+        if expires_at is None:
+            return False
+        try:
+            return float(expires_at) <= now_ts
+        except (TypeError, ValueError):
+            return False
+
+    def _make_entry(self, value: str, now_ts: float) -> dict:
+        return {
+            "value": value,
+            "cached_at": now_ts,
+            "expires_at": now_ts + self.ttl_seconds,
+        }
+
+    def _persist_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def load(self) -> None:
         """ディスクからキャッシュ内容をメモリーに読み込みます。
 
         ファイルが存在しないか破損している場合は空のキャッシュで開始します。
         """
-        if self.path.exists():
-            try:
-                self._data = json.loads(self.path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                self._data = {}
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            self._data = {}
+            return
+
+        if not isinstance(raw, dict):
+            self._data = {}
+            return
+
+        now_ts = self._current_ts()
+        normalized: dict[str, dict] = {}
+        changed = False
+        for key, value in raw.items():
+            if isinstance(value, str):
+                normalized[key] = self._make_entry(value, now_ts)
+                changed = True
+                continue
+            if not isinstance(value, dict):
+                changed = True
+                continue
+            if "value" not in value:
+                changed = True
+                continue
+            entry_value = value.get("value", "")
+            if not isinstance(entry_value, str):
+                entry_value = str(entry_value)
+                changed = True
+            entry = dict(value)
+            entry["value"] = entry_value
+            if self._is_expired(entry, now_ts):
+                changed = True
+                continue
+            if "cached_at" not in entry:
+                entry["cached_at"] = now_ts
+                changed = True
+            if "expires_at" not in entry:
+                entry["expires_at"] = now_ts + self.ttl_seconds
+                changed = True
+            normalized[key] = entry
+
+        self._data = normalized
+        if changed:
+            with self._lock:
+                self._persist_locked()
 
     def get(self, key: str) -> str | None:
         """*key* に対応するキャッシュ値を返します。ミス時は ``None`` を返します。
@@ -176,7 +266,16 @@ class CacheStore:
             キャッシュされた値、またはミス時は ``None`` です。
         """
         with self._lock:
-            return self._data.get(key)
+            entry = self._data.get(key)
+            if not isinstance(entry, dict):
+                return None
+            now_ts = self._current_ts()
+            if self._is_expired(entry, now_ts):
+                self._data.pop(key, None)
+                self._persist_locked()
+                return None
+            value = entry.get("value")
+            return value if isinstance(value, str) else None
 
     def put(self, key: str, value: str) -> None:
         """*key* に *value* を格納し、ディスクに永続化します。
@@ -189,12 +288,9 @@ class CacheStore:
             キャッシュする値 (バリデーション結果) です。
         """
         with self._lock:
-            self._data[key] = value
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            now_ts = self._current_ts()
+            self._data[key] = self._make_entry(value, now_ts)
+            self._persist_locked()
 
 
 @dataclass
@@ -2183,8 +2279,12 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         tracker.mark_completed()
         return
 
+    config = load_config(cache_dir)
     suppressions = load_suppressions(cache_dir)
-    cache = CacheStore(path=cache_dir / ".complete-validator" / "cache.json")
+    cache = CacheStore(
+        path=cache_dir / ".complete-validator" / "cache.json",
+        ttl_seconds=get_cache_ttl_seconds(config),
+    )
     cache.load()
 
     matched_target_files = [
@@ -2200,7 +2300,6 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         tracker.mark_completed()
         return
 
-    config = load_config(cache_dir)
     max_workers = get_max_workers(config)
     default_model = get_default_model(config)
     run_stream_checks(
@@ -2269,8 +2368,12 @@ def main() -> None:
         sys.exit(0)
 
     # ファイル内容を読み込みます。
+    config = load_config(cache_dir)
     suppressions = load_suppressions(cache_dir)
-    cache = CacheStore(path=cache_dir / ".complete-validator" / "cache.json")
+    cache = CacheStore(
+        path=cache_dir / ".complete-validator" / "cache.json",
+        ttl_seconds=get_cache_ttl_seconds(config),
+    )
     cache.load()
 
     # いずれかのルールにマッチするファイルだけ内容を読み込みます。
@@ -2287,7 +2390,6 @@ def main() -> None:
         sys.exit(0)
 
     # チェックを実行し結果を出力します。
-    config = load_config(cache_dir)
     max_workers = get_max_workers(config)
     default_model = get_default_model(config)
     results = run_parallel_checks(
