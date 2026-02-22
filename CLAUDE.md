@@ -434,6 +434,12 @@ cat .complete-validator/stream-results/<stream-id>/worker.log
 
 # queue の未処理 violation を確認
 python3 scripts/check_style.py --list-violations <stream-id> --plugin-dir /path/to/complete-validator
+
+# watch モード (変更検知で自動再チェック)
+python3 scripts/check_style.py --watch --plugin-dir /path/to/complete-validator
+python3 scripts/check_style.py --watch --staged --watch-interval-seconds 1.0 --watch-debounce-seconds 0.5
+# 単発検証用: 最大 1 回だけ再実行して終了
+python3 scripts/check_style.py --watch --watch-max-runs 1
 ```
 
 ### キャッシュ クリア
@@ -1251,9 +1257,11 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
 ### 10. watch モードとバックプレッシャー (拡張方針)
 
 - 現状:
-  - stream モードはあるが watch の常時監視は未導入。
+  - `--watch` の最小実装を導入済み。
+  - 差分シグネチャ変化をポーリング検知し、デバウンス後に自動再チェックを実行できる。
+  - `--watch-max-runs` で実行回数上限を指定できる (0 は無制限)。
 - 方針:
-  - 連続変更時はデバウンス、キュー上限、低優先度の遅延再挿入で過負荷を制御する。
+  - 連続変更時のキュー上限、低優先度の遅延再挿入は未実装。6-2 で対応する。
   - 高 severity はドロップせず優先維持する。
 
 ### 11. セキュリティ・データ保持方針
@@ -1279,12 +1287,13 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
   - stream worker + queue claim/resolve (CAS/lease)
   - F1 非劣化の regression ゲート
   - baseline/optimized の別 run 比較
+  - decision 単位の設定変更監査ログ (`append_rule_config_decision`)
+  - cross-file 再チェック拡大 (`cross_file: true` + `dependency_scope: "python_imports"`)
+  - watch モード最小実装 (`--watch`)
   - dynamic ハーネスの反復上限付き fixpoint ループ (`--max-fixpoint-iterations`)
   - 振動検出 (`state signature`) と `manual_review_required` 出力
 - 方針 (未実装):
-  - cross-file 再チェック拡大
-  - watch モードのデバウンス/バックプレッシャー
-  - decision 単位の設定変更監査ログ
+  - watch モードのバックプレッシャー (キュー上限、遅延再挿入)
   - lock_on_satisfy のアンロック・ヒステリシス
 
 ### 14. 誤解しやすいポイント (実装前に必読)

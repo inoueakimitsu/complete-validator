@@ -74,6 +74,8 @@ DEFAULT_MODEL = "sonnet"
 # キャッシュ TTL のデフォルト (秒) です。既定は 7 日です。
 DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_RULE_CONFIG_VERSION = 1
+DEFAULT_WATCH_INTERVAL_SECONDS = 1.0
+DEFAULT_WATCH_DEBOUNCE_SECONDS = 0.5
 
 
 def _default_rule_config() -> dict:
@@ -1981,7 +1983,101 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="--heartbeat 時に更新する lease 秒数。未指定時は現行 lease_ttl を再利用します。",
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="変更をポーリング検知し、差分が変わった時に自動で再チェックします。",
+    )
+    parser.add_argument(
+        "--watch-interval-seconds",
+        type=float,
+        default=DEFAULT_WATCH_INTERVAL_SECONDS,
+        help="--watch 時のポーリング間隔 (秒)。",
+    )
+    parser.add_argument(
+        "--watch-debounce-seconds",
+        type=float,
+        default=DEFAULT_WATCH_DEBOUNCE_SECONDS,
+        help="--watch 時の変更確定待ち (秒)。",
+    )
+    parser.add_argument(
+        "--watch-max-runs",
+        type=int,
+        default=0,
+        help="--watch 時の最大再実行回数。0 は無制限。",
+    )
     return parser.parse_args()
+
+
+def _watch_diff_fingerprint(diff_chunks: dict[str, str]) -> str:
+    if not diff_chunks:
+        return ""
+    h = hashlib.sha256()
+    for path in sorted(diff_chunks.keys()):
+        h.update(path.encode("utf-8"))
+        h.update(b"\n")
+        h.update(diff_chunks[path].encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _watch_signature(target_files: list[str], diff_chunks: dict[str, str]) -> str:
+    if not target_files:
+        return "EMPTY"
+    files = sorted(target_files)
+    diff_hash = _watch_diff_fingerprint(diff_chunks)
+    return json.dumps({"files": files, "diff_hash": diff_hash}, ensure_ascii=False, sort_keys=True)
+
+
+def build_watch_check_command(args: argparse.Namespace) -> list[str]:
+    cmd = [sys.executable, __file__]
+    if args.staged:
+        cmd.append("--staged")
+    if args.full_scan:
+        cmd.append("--full-scan")
+    if args.plugin_dir:
+        cmd.extend(["--plugin-dir", str(args.plugin_dir)])
+    return cmd
+
+
+def run_watch_mode(args: argparse.Namespace) -> None:
+    if args.full_scan:
+        raise SystemExit("--watch does not support --full-scan because full-scan has no diff signal")
+    interval = max(0.1, float(args.watch_interval_seconds))
+    debounce = max(0.0, float(args.watch_debounce_seconds))
+    max_runs = int(args.watch_max_runs) if int(args.watch_max_runs) > 0 else 0
+
+    command = build_watch_check_command(args)
+    last_applied_signature: str | None = None
+    pending_signature: str | None = None
+    pending_since: float | None = None
+    runs = 0
+
+    while True:
+        target_files, diff_chunks = resolve_target_files(args.staged, full_scan=False)
+        current_signature = _watch_signature(target_files, diff_chunks)
+        now = time.monotonic()
+
+        if current_signature != last_applied_signature and current_signature != pending_signature:
+            pending_signature = current_signature
+            pending_since = now
+
+        ready = (
+            pending_signature is not None
+            and pending_signature != "EMPTY"
+            and pending_since is not None
+            and (now - pending_since) >= debounce
+        )
+        if ready:
+            subprocess.run(command, check=False)
+            last_applied_signature = pending_signature
+            pending_signature = None
+            pending_since = None
+            runs += 1
+            if max_runs > 0 and runs >= max_runs:
+                return
+
+        time.sleep(interval)
 
 
 def resolve_target_files(
@@ -2850,6 +2946,12 @@ def main() -> None:
         return
     if args.heartbeat is not None:
         handle_heartbeat(args)
+        return
+
+    if args.watch:
+        if args.stream or args.stream_worker:
+            raise SystemExit("--watch cannot be combined with --stream/--stream-worker")
+        run_watch_mode(args)
         return
 
     # ストリーム モード: バックグラウンド ワーカーを起動して stream-id を出力します。
