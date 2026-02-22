@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
         help="maximum recheck iterations per dynamic step",
     )
     parser.add_argument(
+        "--oscillation-limit",
+        type=int,
+        default=1,
+        help="number of repeated signatures allowed before manual_review_required",
+    )
+    parser.add_argument(
         "--regression-max-drop",
         type=float,
         default=0.05,
@@ -109,6 +115,20 @@ def _to_check_result(fixture_name: str, entries: list[dict], stream_id: str) -> 
         rule_results=rule_results,
         raw={"entries": entries, "stream_id": stream_id},
     )
+
+
+def _entries_signature(entries: list[dict]) -> str:
+    compact: list[tuple[str, str, str]] = []
+    for entry in entries:
+        compact.append(
+            (
+                str(entry.get("rule", "")),
+                str(entry.get("file", "")),
+                str(entry.get("status", "allow")).lower(),
+            )
+        )
+    compact.sort()
+    return json.dumps(compact, ensure_ascii=False)
 
 
 def _sanitize_recorded_payload(payload: dict) -> dict:
@@ -450,6 +470,7 @@ def run_dynamic(
     fixture_filter: list[str] | None,
     wait_seconds: int,
     max_fixpoint_iterations: int = 3,
+    oscillation_limit: int = 1,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     fm = FixtureManager(runner_cfg.root / "tests" / "fixtures")
     dynamic_fixtures = fm.list_dynamic_fixtures(fixture_filter)
@@ -463,6 +484,7 @@ def run_dynamic(
     total_ms = 0.0
 
     iteration_cap = max(1, int(max_fixpoint_iterations))
+    oscillation_cap = max(1, int(oscillation_limit))
 
     for fixture in dynamic_fixtures:
         work_dir = _init_fixture_repo(runner_cfg.root, fixture)
@@ -486,6 +508,9 @@ def run_dynamic(
                 final_stream_id = stream_id
                 final_entries = entries
                 fixpoint_iterations = 1
+                oscillation_hits = 0
+                signatures_seen = {_entries_signature(final_entries)}
+                manual_review_required = False
                 while fixpoint_iterations < iteration_cap:
                     has_deny = any(str(e.get("status", "allow")).lower() == "deny" for e in final_entries)
                     if not has_deny:
@@ -495,6 +520,14 @@ def run_dynamic(
                     final_stream_id = next_stream_id
                     final_entries = next_entries
                     fixpoint_iterations += 1
+                    signature = _entries_signature(final_entries)
+                    if signature in signatures_seen:
+                        oscillation_hits += 1
+                        if oscillation_hits >= oscillation_cap:
+                            manual_review_required = True
+                            break
+                    else:
+                        signatures_seen.add(signature)
 
                 step_no = int(step_item.get("step", 0))
                 result = _to_check_result(fixture.name, final_entries, final_stream_id)
@@ -517,6 +550,8 @@ def run_dynamic(
                         "step": step_no,
                         "stream_id": final_stream_id,
                         "fixpoint_iterations": fixpoint_iterations,
+                        "manual_review_required": manual_review_required,
+                        "oscillation_hits": oscillation_hits,
                         "rule_results": result.rule_results,
                     },
                 )
@@ -650,6 +685,7 @@ def main() -> None:
             args.fixture,
             args.wait_seconds,
             max_fixpoint_iterations=args.max_fixpoint_iterations,
+            oscillation_limit=args.oscillation_limit,
         )
         print_and_persist(
             scenario=args.scenario,

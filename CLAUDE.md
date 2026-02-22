@@ -1179,9 +1179,11 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
   - dynamic ハーネスには反復上限付き fixpoint ループを実装済み。
   - 各 step で `deny` が残る場合、`--max-fixpoint-iterations` 回まで再チェックを繰り返す。
   - 実行結果には `fixpoint_iterations` を出力し、反復回数を追跡できる。
+  - 振動検出 (`state signature`) により同一状態の再出現を検知し、`manual_review_required` で停止できる。
+  - 実行結果には `oscillation_hits` と `manual_review_required` を出力する。
 - 方針:
-  - 振動検出 (`state signature`) と manual review 退避を追加し、収束しないループを自動停止する。
-  - 同一状態の再出現を cycle とみなし、振動時は自動修正を止めて manual review にエスカレーションする。
+  - `state_signature` の粒度改善 (ファイル内容ハッシュ等) と cycle 判定精度を高める。
+  - 振動時の自動エスカレーション先 (manual review queue) を本体に統合する。
 
 ### 8. cross-file ルール時の再チェック拡大 (拡張方針)
 
@@ -1231,8 +1233,8 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
   - F1 非劣化の regression ゲート
   - baseline/optimized の別 run 比較
   - dynamic ハーネスの反復上限付き fixpoint ループ (`--max-fixpoint-iterations`)
+  - 振動検出 (`state signature`) と `manual_review_required` 出力
 - 方針 (未実装):
-  - 振動検出 (state signature) / manual review 退避
   - cross-file 再チェック拡大
   - watch モードのデバウンス/バックプレッシャー
   - decision 単位の設定変更監査ログ
