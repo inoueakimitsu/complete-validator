@@ -79,6 +79,9 @@ DEFAULT_WATCH_DEBOUNCE_SECONDS = 0.5
 DEFAULT_WATCH_QUEUE_MAX = 8
 DEFAULT_WATCH_REINSERT_DELAY_SECONDS = 2.0
 DEFAULT_WATCH_HISTORY_TTL_SECONDS = 3600
+DEFAULT_WATCH_TREND_WINDOW_SECONDS = 1800
+DEFAULT_WATCH_TREND_THRESHOLD_MEDIUM = 3
+DEFAULT_WATCH_TREND_THRESHOLD_HIGH = 6
 WATCH_PRIORITY_HIGH = 0
 WATCH_PRIORITY_MEDIUM = 1
 WATCH_PRIORITY_NORMAL = 2
@@ -2216,6 +2219,41 @@ def _watch_priority_from_history_stats(root: Path, target_files: list[str], ttl_
     return best
 
 
+def _watch_priority_from_history_trend(
+    root: Path,
+    target_files: list[str],
+    ttl_seconds: int,
+    now_ts: float | None = None,
+) -> int:
+    if not target_files:
+        return WATCH_PRIORITY_NORMAL
+    stats = _load_watch_priority_stats(root)
+    files = stats.get("files", {})
+    if not isinstance(files, dict):
+        return WATCH_PRIORITY_NORMAL
+    now = now_ts if now_ts is not None else time.time()
+    best = WATCH_PRIORITY_NORMAL
+    for path in target_files:
+        entry = files.get(path)
+        if not isinstance(entry, dict):
+            continue
+        last_seen = float(entry.get("last_seen_at", 0.0))
+        if ttl_seconds > 0 and (now - last_seen) > ttl_seconds:
+            continue
+        last_priority = int(entry.get("last_priority", WATCH_PRIORITY_NORMAL))
+        trend_seen_count = int(entry.get("trend_seen_count", 0))
+        trend_priority = last_priority
+        if trend_seen_count >= DEFAULT_WATCH_TREND_THRESHOLD_HIGH:
+            trend_priority = WATCH_PRIORITY_HIGH
+        elif trend_seen_count >= DEFAULT_WATCH_TREND_THRESHOLD_MEDIUM:
+            trend_priority = max(WATCH_PRIORITY_HIGH, last_priority - 1)
+        if trend_priority < best:
+            best = trend_priority
+            if best == WATCH_PRIORITY_HIGH:
+                return best
+    return best
+
+
 def _update_watch_priority_stats(root: Path, target_files: list[str], priority: int) -> None:
     if not target_files:
         return
@@ -2228,9 +2266,18 @@ def _update_watch_priority_stats(root: Path, target_files: list[str], priority: 
         entry = files.get(path, {})
         if not isinstance(entry, dict):
             entry = {}
+        window_started = float(entry.get("trend_window_started_at", now))
+        trend_seen_count = int(entry.get("trend_seen_count", 0))
+        if (now - window_started) > DEFAULT_WATCH_TREND_WINDOW_SECONDS:
+            window_started = now
+            trend_seen_count = 1
+        else:
+            trend_seen_count += 1
         entry["last_priority"] = int(priority)
         entry["last_seen_at"] = now
         entry["seen_count"] = int(entry.get("seen_count", 0)) + 1
+        entry["trend_window_started_at"] = window_started
+        entry["trend_seen_count"] = trend_seen_count
         files[path] = entry
     stats["files"] = files
     _save_watch_priority_stats(root, stats)
@@ -2363,6 +2410,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
             _watch_priority_from_rule_severity(target_files, rules),
             _watch_priority_from_recent_queue(root, target_files),
             _watch_priority_from_history_stats(root, target_files, history_ttl),
+            _watch_priority_from_history_trend(root, target_files, history_ttl),
         )
         _update_watch_priority_stats(root, target_files, current_priority)
         now = time.monotonic()

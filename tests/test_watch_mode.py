@@ -376,3 +376,91 @@ def test_watch_priority_from_history_stats_ignores_expired_record(tmp_path):
     finally:
         check_style.time.time = original_time
     assert priority == check_style.WATCH_PRIORITY_NORMAL
+
+
+def test_watch_priority_from_history_trend_escalates_with_repeated_events(tmp_path):
+    check_style = _load_check_style_module()
+    now = 1_700_000_000.0
+    check_style._save_watch_priority_stats(
+        tmp_path,
+        {
+            "version": 1,
+            "files": {
+                "notes.md": {
+                    "last_priority": check_style.WATCH_PRIORITY_NORMAL,
+                    "last_seen_at": now - 10.0,
+                    "seen_count": 10,
+                    "trend_window_started_at": now - 60.0,
+                    "trend_seen_count": 4,
+                }
+            },
+        },
+    )
+
+    priority = check_style._watch_priority_from_history_trend(
+        tmp_path,
+        ["notes.md"],
+        ttl_seconds=3600,
+        now_ts=now,
+    )
+    assert priority == check_style.WATCH_PRIORITY_MEDIUM
+
+
+def test_watch_priority_from_history_trend_ignores_expired_entries(tmp_path):
+    check_style = _load_check_style_module()
+    now = 1_700_000_000.0
+    check_style._save_watch_priority_stats(
+        tmp_path,
+        {
+            "version": 1,
+            "files": {
+                "notes.md": {
+                    "last_priority": check_style.WATCH_PRIORITY_HIGH,
+                    "last_seen_at": now - 7200.0,
+                    "seen_count": 10,
+                    "trend_window_started_at": now - 60.0,
+                    "trend_seen_count": 10,
+                }
+            },
+        },
+    )
+
+    priority = check_style._watch_priority_from_history_trend(
+        tmp_path,
+        ["notes.md"],
+        ttl_seconds=3600,
+        now_ts=now,
+    )
+    assert priority == check_style.WATCH_PRIORITY_NORMAL
+
+
+def test_update_watch_priority_stats_resets_trend_window_after_timeout(tmp_path):
+    check_style = _load_check_style_module()
+    base_now = 1_700_000_000.0
+    check_style._save_watch_priority_stats(
+        tmp_path,
+        {
+            "version": 1,
+            "files": {
+                "notes.md": {
+                    "last_priority": check_style.WATCH_PRIORITY_NORMAL,
+                    "last_seen_at": base_now - 10.0,
+                    "seen_count": 2,
+                    "trend_window_started_at": base_now - (check_style.DEFAULT_WATCH_TREND_WINDOW_SECONDS + 1),
+                    "trend_seen_count": 2,
+                }
+            },
+        },
+    )
+
+    original_time = check_style.time.time
+    check_style.time.time = lambda: base_now
+    try:
+        check_style._update_watch_priority_stats(tmp_path, ["notes.md"], check_style.WATCH_PRIORITY_NORMAL)
+    finally:
+        check_style.time.time = original_time
+
+    stats = check_style._load_watch_priority_stats(tmp_path)
+    entry = stats["files"]["notes.md"]
+    assert entry["trend_seen_count"] == 1
+    assert entry["trend_window_started_at"] == base_now
