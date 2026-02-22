@@ -1,0 +1,28 @@
+{
+  "fixture": "case_03_mixed_files",
+  "mode": "baseline",
+  "generated_at": 1771725789,
+  "exit_code": 0,
+  "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nChecking all rules in the checklist against `util.py`:\n\n**Rule checked: Naming style** (`readable_code/02_naming.md`)\n\n- `sanitize` — concise, conventional, intent is clear. No flag.\n- `value` — conventional parameter name, intent is clear. No flag.\n\nNo violations found.\n\n[Rule: readable_code/03_comments.md | File: util.py]\nNo violations found.\n",
+  "stderr": "",
+  "rule_results": [
+    {
+      "rule": "readable_code/02_naming.md",
+      "status": "allow",
+      "file": "util.py",
+      "message": "[Rule: readable_code/02_naming.md | File: util.py]"
+    },
+    {
+      "rule": "readable_code/03_comments.md",
+      "status": "allow",
+      "file": "util.py",
+      "message": "[Rule: readable_code/03_comments.md | File: util.py]"
+    }
+  ],
+  "raw": {
+    "exit_code": 0,
+    "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nChecking all rules in the checklist against `util.py`:\n\n**Rule checked: Naming style** (`readable_code/02_naming.md`)\n\n- `sanitize` — concise, conventional, intent is clear. No flag.\n- `value` — conventional parameter name, intent is clear. No flag.\n\nNo violations found.\n\n[Rule: readable_code/03_comments.md | File: util.py]\nNo violations found.\n",
+    "stderr": "",
+    "config_path": "tests/configs/baseline.json"
+  }
+}

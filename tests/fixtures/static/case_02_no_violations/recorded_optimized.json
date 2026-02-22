@@ -1,0 +1,22 @@
+{
+  "fixture": "case_02_no_violations",
+  "mode": "optimized",
+  "generated_at": 1771725804,
+  "exit_code": 0,
+  "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: main.py]\nNo violations found.\n",
+  "stderr": "",
+  "rule_results": [
+    {
+      "rule": "readable_code/02_naming.md",
+      "status": "allow",
+      "file": "main.py",
+      "message": "[Rule: readable_code/02_naming.md | File: main.py]"
+    }
+  ],
+  "raw": {
+    "exit_code": 0,
+    "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: main.py]\nNo violations found.\n",
+    "stderr": "",
+    "config_path": "tests/configs/optimized.json"
+  }
+}

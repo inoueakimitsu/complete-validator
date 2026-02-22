@@ -1,0 +1,22 @@
+{
+  "fixture": "case_01_python_violations",
+  "mode": "optimized",
+  "generated_at": 1771725799,
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: main.py]\n**File:** `main.py`\n\n**Rule checked:** Naming style (`readable_code/02_naming.md`)\n\n**Violations found:**\n\n- **Line 3** — `bad_function`: Flagged placeholder name (rule explicitly lists `bad_function` as always-flag).\n- **Line 3** — `x`: Single-letter parameter name not used as a loop index.\n- **Line 3** — `y`: Single-letter parameter name not used as a loop index.\n- **Line 4–5** — `'tmp'`: Flagged placeholder string literal. Note: the rule targets names, not string literals — this may not strictly apply, but flagging for confirmation since `tmp` appears as a value rather than an identifier.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and re-run.\n",
+  "rule_results": [
+    {
+      "rule": "readable_code/02_naming.md",
+      "status": "deny",
+      "file": "main.py",
+      "message": "[Rule: readable_code/02_naming.md | File: main.py]"
+    }
+  ],
+  "raw": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: main.py]\n**File:** `main.py`\n\n**Rule checked:** Naming style (`readable_code/02_naming.md`)\n\n**Violations found:**\n\n- **Line 3** — `bad_function`: Flagged placeholder name (rule explicitly lists `bad_function` as always-flag).\n- **Line 3** — `x`: Single-letter parameter name not used as a loop index.\n- **Line 3** — `y`: Single-letter parameter name not used as a loop index.\n- **Line 4–5** — `'tmp'`: Flagged placeholder string literal. Note: the rule targets names, not string literals — this may not strictly apply, but flagging for confirmation since `tmp` appears as a value rather than an identifier.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and re-run.\n",
+    "config_path": "tests/configs/optimized.json"
+  }
+}

@@ -25,16 +25,31 @@ import subprocess
 import sys
 import threading
 import time
+from enum import Enum
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
+from uuid import uuid4
 
 
 # v4: 全モードで per-file 単位 (1 ルール × 1 ファイル) の並列実行に統一しています。
 # v3 は hook がルール単位、ストリームが per-file でした。v2 は全ルール一括、v1 はファイル単位でした。
 PROMPT_VERSION = "4"
+VIOLATION_STATUS_SCHEMA_VERSION = "1"
+DEFAULT_LEASE_TTL_SECONDS = 300
+DEFAULT_LEASE_GRACE_PERIOD_SECONDS = 30
+
+
+class ViolationStatus(str, Enum):
+    """永続的な violation 処理状態の enum."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    RESOLVED = "resolved"
+    MANUAL_REVIEW = "manual_review"
+    STALE = "stale"
 
 # (rule_filename, glob_patterns, body) のリストです。
 RuleList = list[tuple[str, list[str], str]]
@@ -58,7 +73,7 @@ DEFAULT_MODEL = "sonnet"
 
 
 def load_config(config_dir: Path) -> dict:
-    """.complete-validator/config.json から設定を読み込みます。
+    """.complete-validator/config.json または RULE_VALIDATOR_CONFIG_PATH から設定を読み込みます。
 
     Parameters
     ----------
@@ -70,7 +85,12 @@ def load_config(config_dir: Path) -> dict:
     dict
         設定の辞書です。ファイルが存在しない場合は空辞書を返します。
     """
-    config_path = config_dir / ".complete-validator" / "config.json"
+    explicit_path = os.environ.get("RULE_VALIDATOR_CONFIG_PATH")
+    if explicit_path:
+        config_path = Path(explicit_path)
+    else:
+        config_path = config_dir / ".complete-validator" / "config.json"
+
     if config_path.exists():
         try:
             return json.loads(config_path.read_text(encoding="utf-8"))
@@ -274,6 +294,450 @@ def cleanup_old_stream_results(base_dir: Path) -> None:
     )
     for old_dir in dirs[MAX_STREAM_RESULTS_DIRS:]:
         shutil.rmtree(old_dir, ignore_errors=True)
+
+
+def _repository_root() -> Path:
+    git_toplevel = run_git("rev-parse", "--show-toplevel")
+    return Path(git_toplevel) if git_toplevel else Path.cwd()
+
+
+def _safe_filename(name: str) -> str:
+    return (
+        name.replace("/", "__")
+        .replace("\\", "__")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+
+def _now_timestamp() -> float:
+    return time.time()
+
+
+def _now_iso8601() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def _normalize_target_path(root: Path, file_path: str) -> str:
+    try:
+        rel = os.path.relpath(file_path, root)
+    except ValueError:
+        rel = file_path
+    return rel.replace(os.sep, "/")
+
+
+def _severity_priority(severity: str) -> int:
+    normalized = (severity or "").strip().lower()
+    if normalized == "critical":
+        return 0
+    if normalized == "high":
+        return 100
+    if normalized == "medium":
+        return 200
+    if normalized == "low":
+        return 300
+    if normalized == "info":
+        return 400
+    return 500
+
+
+def _build_violation_id(rule_id: str, canonical_file_path: str) -> str:
+    return hashlib.sha256(f"{rule_id}\n{canonical_file_path}".encode("utf-8")).hexdigest()
+
+
+def _violations_dir(root: Path) -> tuple[Path, Path]:
+    base = root / ".complete-validator" / "violations"
+    return base / "results", base / "queue"
+
+
+def _queue_state_path(queue_dir: Path, violation_id: str, status: ViolationStatus, priority: int) -> Path:
+    safe_priority = max(0, min(999, int(priority)))
+    filename = f"{safe_priority:03d}__{status.value}__{violation_id}.state.json"
+    return queue_dir / filename
+
+
+def _write_json_atomically(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    with open(tmp_path, "wb") as handle:
+        handle.write(
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
+def _replace_state_file(state_path: Path, next_state_path: Path, state: dict) -> bool:
+    """既存ステートを排他で遷移します。
+
+    Parameters
+    ----------
+    state_path: Path
+        現在の状態ファイルパスです。
+    next_state_path: Path
+        遷移後の状態ファイルパスです。
+    state: dict
+        書き込むステート内容です。
+
+    Returns
+    -------
+    bool
+        遷移が成功した場合 True。
+    """
+    lock_token = state_path.with_name(f".{state_path.name}.{uuid4().hex}.lock")
+    try:
+        os.replace(state_path, lock_token)
+    except FileNotFoundError:
+        return False
+
+    try:
+        _write_json_atomically(lock_token, state)
+        os.replace(lock_token, next_state_path)
+        return True
+    except Exception:
+        # 片側で失敗した場合は復旧を試みる。
+        try:
+            os.replace(lock_token, state_path)
+        except OSError:
+            pass
+        return False
+
+
+def _read_json_file(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _is_violation_state_file(path: Path) -> tuple[ViolationStatus, int, str] | None:
+    match = re.match(
+        r"^(?P<priority>\d{3})__(?P<status>[a-z_]+)__(?P<id>[0-9a-f]{64})\.state\.json$",
+        path.name,
+    )
+    if not match:
+        return None
+    try:
+        status = ViolationStatus(match.group("status"))
+    except ValueError:
+        return None
+    return status, int(match.group("priority")), match.group("id")
+
+
+def _list_queue_states(
+    queue_dir: Path,
+    stream_id: str | None = None,
+    violation_id: str | None = None,
+    statuses: set[ViolationStatus] | None = None,
+) -> list[tuple[Path, dict, int, ViolationStatus]]:
+    if not queue_dir.exists():
+        return []
+
+    states: list[tuple[Path, dict, int, ViolationStatus]] = []
+    status_filter = statuses if statuses is not None else None
+
+    for path in sorted(queue_dir.iterdir()):
+        if not path.is_file():
+            continue
+        parsed = _is_violation_state_file(path)
+        if not parsed:
+            continue
+        file_status, priority, _id = parsed
+        if violation_id is not None and _id != violation_id:
+            continue
+        data = _read_json_file(path)
+        if not isinstance(data, dict):
+            continue
+        if data.get("id") and _id != data.get("id"):
+            continue
+        if stream_id is not None and data.get("run_id") != stream_id:
+            continue
+        if status_filter is not None and file_status not in status_filter:
+            continue
+        states.append((path, data, priority, file_status))
+
+    states.sort(
+        key=lambda item: (
+            item[2],
+            _severity_priority(item[1].get("severity", "")),
+            item[1].get("detected_at", ""),
+            item[0].name,
+        )
+    )
+    return states
+
+
+def _is_lease_expired(state: dict, now_ts: float) -> bool:
+    lease_value = state.get("lease_expires_at")
+    if lease_value is None:
+        return False
+    try:
+        lease_ts = float(lease_value)
+    except (TypeError, ValueError):
+        return False
+    return lease_ts <= now_ts - DEFAULT_LEASE_GRACE_PERIOD_SECONDS
+
+
+def _collect_orphan_in_progress_for_file(
+    queue_dir: Path,
+    target_file_path: str,
+    exclude_path: Path,
+    now_ts: float,
+) -> list[tuple[Path, dict, int]]:
+    locked: list[tuple[Path, dict, int]] = []
+    for path, data, priority, status in _list_queue_states(queue_dir, statuses={ViolationStatus.IN_PROGRESS}):
+        if path == exclude_path:
+            continue
+        if data.get("target_file_path") != target_file_path:
+            continue
+        if _is_lease_expired(data, now_ts):
+            continue
+        locked.append((path, data, priority))
+    return locked
+
+
+def _force_expired_to_pending(queue_dir: Path, now_ts: float) -> int:
+    changed = 0
+    for path, data, priority, _status in _list_queue_states(
+        queue_dir,
+        statuses={ViolationStatus.IN_PROGRESS},
+    ):
+        if not _is_lease_expired(data, now_ts):
+            continue
+        next_state = dict(data)
+        next_state["status"] = ViolationStatus.PENDING.value
+        next_state["state_version"] = int(data.get("state_version", 0)) + 1
+        next_state["lease_expires_at"] = None
+        next_state["claimed_at"] = None
+        next_state["claim_uuid"] = None
+        next_state["owner"] = None
+        next_state["updated_at"] = _now_iso8601()
+        target_priority = _severity_priority(data.get("severity", ""))
+        new_path = _queue_state_path(queue_dir, data.get("id", ""), ViolationStatus.PENDING, target_priority)
+        if _replace_state_file(path, new_path, next_state):
+            changed += 1
+    return changed
+
+
+def _list_violations_for_queue(
+    stream_id: str,
+    statuses: set[ViolationStatus] | None = None,
+    include_unassigned: bool = False,
+) -> list[dict]:
+    root = _repository_root()
+    _, queue_dir = _violations_dir(root)
+    now_ts = _now_timestamp()
+    _force_expired_to_pending(queue_dir, now_ts)
+
+    status_filter = (
+        statuses
+        if statuses is not None
+        else {ViolationStatus.PENDING, ViolationStatus.IN_PROGRESS}
+    )
+    collected = []
+    for path, data, priority, status in _list_queue_states(
+        queue_dir,
+        stream_id=stream_id,
+        statuses=status_filter,
+    ):
+        if not include_unassigned and data.get("id") is None:
+            continue
+        collected.append({
+            "path": str(path),
+            "id": data.get("id"),
+            "rule": data.get("rule"),
+            "target_file_path": data.get("target_file_path"),
+            "status": status.value,
+            "severity": data.get("severity", "medium"),
+            "priority": priority,
+            "state_version": data.get("state_version", 0),
+            "owner": data.get("owner"),
+            "claim_uuid": data.get("claim_uuid"),
+            "run_id": data.get("run_id"),
+            "detected_at": data.get("detected_at"),
+            "lease_expires_at": data.get("lease_expires_at"),
+            "source": str(data.get("source", "")),
+        })
+    return collected
+
+
+def _active_in_progress_for_violation(
+    queue_dir: Path,
+    violation_id: str,
+    now_ts: float,
+) -> list[tuple[Path, dict, int, ViolationStatus]]:
+    active: list[tuple[Path, dict, int, ViolationStatus]] = []
+    for path, state, priority, status in _list_queue_states(
+        queue_dir,
+        violation_id=violation_id,
+        statuses={ViolationStatus.IN_PROGRESS},
+    ):
+        if status != ViolationStatus.IN_PROGRESS:
+            continue
+        if _is_lease_expired(state, now_ts):
+            continue
+        active.append((path, state, priority, status))
+    return active
+
+
+def upsert_queue_state_from_stream_result(
+    stream_id: str,
+    base_dir: Path,
+    rule_name: str,
+    file_path: str,
+    status: str,
+    message: str,
+    model: str,
+    cache_hit: bool,
+) -> None:
+    """ストリーム結果から queue state を永続化/更新します。"""
+    _, queue_dir = _violations_dir(base_dir)
+    canonical_path = _normalize_target_path(base_dir, file_path)
+    violation_id = _build_violation_id(rule_name, canonical_path)
+    now_ts = _now_timestamp()
+    _force_expired_to_pending(queue_dir, now_ts)
+
+    active_claims = _active_in_progress_for_violation(queue_dir, violation_id, now_ts)
+    if active_claims:
+        # 進行中処理中の状態がある場合、再 claim の可能性を避けるため
+        # 書き換えを行わない。次回再検知で解放されるまで保留。
+        return
+
+    current_status: ViolationStatus = ViolationStatus.RESOLVED
+    severity = "medium"
+
+    if status == "deny":
+        current_status = ViolationStatus.PENDING
+        severity = "high"
+    elif status == "error":
+        current_status = ViolationStatus.MANUAL_REVIEW
+        severity = "high"
+
+    normalized_message = message.strip() if message else ""
+    state_data = {
+        "schema_version": VIOLATION_STATUS_SCHEMA_VERSION,
+        "id": violation_id,
+        "rule": rule_name,
+        "target_file_path": canonical_path,
+        "status": current_status.value,
+        "severity": severity,
+        "violations": [{"detail": normalized_message, "location_hint": ""}],
+        "run_id": stream_id,
+        "detected_at": _now_iso8601(),
+        "checker_model": model,
+        "context_level": "diff_only",
+        "cache_hit": cache_hit,
+        "state_version": 0,
+        "lease_expires_at": None,
+        "claimed_at": None,
+        "claim_uuid": None,
+        "owner": None,
+        "source": {
+            "stream_id": stream_id,
+            "model": model,
+            "cache_hit": cache_hit,
+            "updated_via": "run_stream_checks",
+        },
+    }
+
+    existing_states = _list_queue_states(
+        queue_dir,
+        violation_id=violation_id,
+    )
+
+    state_version = 0
+    if existing_states:
+        # 最も新しい既存状態のバージョンを継続的に上げる。
+        state_version = max(
+            int(data.get("state_version", 0))
+            for _, data, _, _ in existing_states
+        )
+
+    priority = _severity_priority(severity)
+    state_path = _queue_state_path(queue_dir, violation_id, current_status, priority)
+    state_data["state_version"] = state_version + 1
+    state_data["updated_at"] = _now_iso8601()
+
+    if existing_states:
+        old_state_path, _old_data, _, _ = existing_states[0]
+        if not _replace_state_file(old_state_path, state_path, state_data):
+            return None
+        for old_state_path, _old_data, _, _ in existing_states[1:]:
+            if old_state_path == state_path:
+                continue
+            try:
+                old_state_path.unlink()
+            except FileNotFoundError:
+                pass
+    else:
+        _write_json_atomically(state_path, state_data)
+
+    return state_data
+
+
+def _hash_violation_fingerprint(
+    rule_id: str,
+    severity: str,
+    location_hint: str,
+    detail: str,
+    detector_version: str,
+) -> str:
+    material = f"{rule_id}|{severity}|{location_hint}|{detail}|{detector_version}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def write_violations_result_append(
+    root: Path,
+    stream_id: str,
+    rule_name: str,
+    file_path: str,
+    status: str,
+    message: str,
+    cache_hit: bool,
+    model: str,
+) -> None:
+    results_dir, _ = _violations_dir(root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    canonical_path = _normalize_target_path(root, file_path)
+    violation_id = _build_violation_id(rule_name, canonical_path)
+    severity = "high" if status in {"deny", "error"} else "medium"
+    fingerprint = _hash_violation_fingerprint(
+        rule_name,
+        severity,
+        canonical_path,
+        message.strip(),
+        model,
+    )
+
+    payload = {
+        "schema_version": VIOLATION_STATUS_SCHEMA_VERSION,
+        "run_id": stream_id,
+        "id": violation_id,
+        "rule": rule_name,
+        "file": canonical_path,
+        "status": "pending" if status in {"deny", "error"} else "resolved",
+        "severity": severity,
+        "violations": [
+            {
+                "detail": message.strip(),
+                "location_hint": canonical_path,
+                "fingerprint": fingerprint,
+            }
+        ],
+        "checker_model": model,
+        "context_level": "diff_only",
+        "cache_hit": cache_hit,
+        "detected_at": _now_iso8601(),
+    }
+    record_path = (
+        results_dir
+        / f"{violation_id}__{stream_id}__{int(time.time_ns())}.json"
+    )
+    _write_json_atomically(record_path, payload)
 
 
 def write_result_file(
@@ -993,6 +1457,51 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="内部用: ワーカー プロセスのストリーム ID です。",
     )
+    parser.add_argument(
+        "--list-violations",
+        metavar="STREAM_ID",
+        type=str,
+        default=None,
+        help="指定した stream-id の未処理 violation を JSON で出力します。",
+    )
+    parser.add_argument(
+        "--claim",
+        metavar=("STREAM_ID", "VIOLATION_ID"),
+        nargs=2,
+        default=None,
+        help="violation を claim して排他制御に入ります。<stream-id> <violation-id> を指定します。",
+    )
+    parser.add_argument(
+        "--resolve",
+        metavar=("STREAM_ID", "VIOLATION_ID"),
+        nargs=2,
+        default=None,
+        help="violation を resolved に更新します。<stream-id> <violation-id> を指定します。",
+    )
+    parser.add_argument(
+        "--claim-uuid",
+        type=str,
+        default=None,
+        help="--resolve 時の CAS 用 claim_uuid。",
+    )
+    parser.add_argument(
+        "--state-version",
+        type=int,
+        default=None,
+        help="--resolve 時の CAS 用 state_version。",
+    )
+    parser.add_argument(
+        "--owner",
+        type=str,
+        default=None,
+        help="--claim 時の owner 表示名。",
+    )
+    parser.add_argument(
+        "--lease-ttl",
+        type=int,
+        default=DEFAULT_LEASE_TTL_SECONDS,
+        help="--claim 時の lease 秒数。",
+    )
     return parser.parse_args()
 
 
@@ -1182,6 +1691,7 @@ def run_stream_checks(
     log_file: Path | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
     model: str = DEFAULT_MODEL,
+    stream_id: str = "",
 ) -> None:
     """per-file 単位でルール チェックを並列実行し、結果をディスクに書き出します。
 
@@ -1252,16 +1762,282 @@ def run_stream_checks(
             try:
                 r_rule, r_file, r_status, r_message, r_cache_hit = future.result(timeout=timeout)
                 write_result_file(results_dir, r_rule, r_file, r_status, r_message, r_cache_hit)
+                upsert_queue_state_from_stream_result(
+                    stream_id=stream_id,
+                    base_dir=results_dir.parent.parent,
+                    rule_name=r_rule,
+                    file_path=r_file,
+                    status=r_status,
+                    message=r_message,
+                    model=model,
+                    cache_hit=r_cache_hit,
+                )
+                write_violations_result_append(
+                    root=results_dir.parent.parent,
+                    stream_id=stream_id,
+                    rule_name=r_rule,
+                    file_path=r_file,
+                    status=r_status,
+                    message=r_message,
+                    cache_hit=r_cache_hit,
+                    model=model,
+                )
                 tracker.update(r_status)
                 log(f"[{r_status}] {r_rule} | {r_file} (cache={r_cache_hit})")
             except Exception as e:
                 failed_rule, failed_file = futures[future]
                 write_result_file(results_dir, failed_rule, failed_file, "error", str(e), False)
+                upsert_queue_state_from_stream_result(
+                    stream_id=stream_id,
+                    base_dir=results_dir.parent.parent,
+                    rule_name=failed_rule,
+                    file_path=failed_file,
+                    status="error",
+                    message=str(e),
+                    model=model,
+                    cache_hit=False,
+                )
+                write_violations_result_append(
+                    root=results_dir.parent.parent,
+                    stream_id=stream_id,
+                    rule_name=failed_rule,
+                    file_path=failed_file,
+                    status="error",
+                    message=str(e),
+                    cache_hit=False,
+                    model=model,
+                )
                 tracker.update("error")
                 log(f"[error] {failed_rule} | {failed_file}: {e}")
 
     tracker.mark_completed()
     log("Stream completed.")
+
+
+def handle_list_violations(args: argparse.Namespace) -> None:
+    """未処理/進行中の violation を表示します。"""
+    stream_id = args.list_violations
+    if not stream_id:
+        print(json.dumps({"ok": False, "error": "stream-id is required"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    entries = _list_violations_for_queue(stream_id)
+    payload = {
+        "ok": True,
+        "stream_id": stream_id,
+        "count": len(entries),
+        "entries": entries,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    sys.exit(0)
+
+
+def handle_claim(args: argparse.Namespace) -> None:
+    """violation を claim します。"""
+    stream_id, violation_id = args.claim
+    if not stream_id or not violation_id:
+        print(json.dumps({"ok": False, "error": "--claim requires <stream-id> <violation-id>"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    host_name = os.environ.get("HOSTNAME")
+    if not host_name and hasattr(os, "uname"):
+        host_name = os.uname().nodename
+    owner = args.owner or f"{os.getpid()}@{host_name or 'local'}"
+    lease_ttl = args.lease_ttl or DEFAULT_LEASE_TTL_SECONDS
+    if lease_ttl <= 0:
+        lease_ttl = DEFAULT_LEASE_TTL_SECONDS
+
+    root = _repository_root()
+    _, queue_dir = _violations_dir(root)
+    if not queue_dir.exists():
+        print(json.dumps({"ok": False, "error": "queue directory not found"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    now_ts = _now_timestamp()
+    _force_expired_to_pending(queue_dir, now_ts)
+
+    candidates = _list_queue_states(
+        queue_dir,
+        stream_id=stream_id,
+        violation_id=violation_id,
+        statuses={ViolationStatus.PENDING},
+    )
+    if not candidates:
+        print(json.dumps({"ok": False, "error": "target violation not found or already claimed"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    state_path, state, priority, _status = sorted(candidates, key=lambda item: item[2])[0]
+    next_state = dict(state)
+    next_state["status"] = ViolationStatus.IN_PROGRESS.value
+    next_state["owner"] = owner
+    next_state["claim_uuid"] = uuid4().hex
+    next_state["state_version"] = int(state.get("state_version", 0)) + 1
+    next_state["claimed_at"] = now_ts
+    next_state["lease_ttl"] = lease_ttl
+    next_state["lease_expires_at"] = now_ts + lease_ttl
+    next_state["updated_at"] = _now_iso8601()
+
+    target_file_path = state.get("target_file_path", "")
+    conflict_locks = _collect_orphan_in_progress_for_file(queue_dir, target_file_path, state_path, now_ts)
+    if conflict_locks:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "target file is locked by another claim",
+                    "conflicting_claims": [
+                        lock_state.get("claim_uuid") for _, lock_state, _ in conflict_locks
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    new_state_path = _queue_state_path(
+        queue_dir,
+        violation_id,
+        ViolationStatus.IN_PROGRESS,
+        priority,
+    )
+    if not _replace_state_file(state_path, new_state_path, next_state):
+        print(
+            json.dumps(
+                {"ok": False, "error": "failed to claim due concurrent update"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    payload = {
+        "ok": True,
+        "stream_id": stream_id,
+        "violation_id": violation_id,
+        "status": ViolationStatus.IN_PROGRESS.value,
+        "state_version": next_state.get("state_version", 0),
+        "claim_uuid": next_state.get("claim_uuid"),
+        "owner": owner,
+        "lease_expires_at": next_state.get("lease_expires_at"),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    sys.exit(0)
+
+
+def handle_resolve(args: argparse.Namespace) -> None:
+    """violation を resolved に更新します。"""
+    stream_id, violation_id = args.resolve
+    if not stream_id or not violation_id:
+        print(json.dumps({"ok": False, "error": "--resolve requires <stream-id> <violation-id>"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    root = _repository_root()
+    _, queue_dir = _violations_dir(root)
+    if not queue_dir.exists():
+        print(json.dumps({"ok": False, "error": "queue directory not found"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    now_ts = _now_timestamp()
+    _force_expired_to_pending(queue_dir, now_ts)
+
+    candidates = _list_queue_states(
+        queue_dir,
+        stream_id=stream_id,
+        violation_id=violation_id,
+    )
+    if not candidates:
+        print(json.dumps({"ok": False, "error": "target violation not found"}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    state_path, state, priority, status = candidates[0]
+    if status == ViolationStatus.RESOLVED:
+        print(
+            json.dumps(
+                {"ok": True, "stream_id": stream_id, "violation_id": violation_id, "status": status.value},
+                ensure_ascii=False,
+            )
+        )
+        sys.exit(0)
+
+    if status != ViolationStatus.IN_PROGRESS:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": f"cannot resolve with status {status.value}",
+                    "status": status.value,
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.claim_uuid and state.get("claim_uuid") != args.claim_uuid:
+        print(
+            json.dumps(
+                {"ok": False, "error": "claim_uuid mismatch"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.state_version is not None and state.get("state_version") != args.state_version:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "state_version mismatch",
+                    "expected": args.state_version,
+                    "actual": state.get("state_version"),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    next_state = dict(state)
+    next_state["status"] = ViolationStatus.RESOLVED.value
+    next_state["state_version"] = int(state.get("state_version", 0)) + 1
+    next_state["resolved_at"] = now_ts
+    next_state["owner"] = None
+    next_state["claim_uuid"] = None
+    next_state["lease_expires_at"] = None
+    next_state["claimed_at"] = None
+    next_state["updated_at"] = _now_iso8601()
+
+    new_state_path = _queue_state_path(
+        queue_dir,
+        violation_id,
+        ViolationStatus.RESOLVED,
+        priority,
+    )
+    if not _replace_state_file(state_path, new_state_path, next_state):
+        print(
+            json.dumps(
+                {"ok": False, "error": "failed to resolve due concurrent update"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "stream_id": stream_id,
+                "violation_id": violation_id,
+                "status": ViolationStatus.RESOLVED.value,
+                "state_version": next_state.get("state_version", 0),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    sys.exit(0)
 
 
 def format_and_output(
@@ -1433,12 +2209,23 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         full_scan=full_scan, log_file=log_file,
         max_workers=max_workers,
         model=default_model,
+        stream_id=stream_id,
     )
 
 
 def main() -> None:
     """AI バリデーターを実行します: 引数パース、ルール読み込み、ファイル チェックを行います。"""
     args = parse_args()
+
+    if args.list_violations is not None:
+        handle_list_violations(args)
+        return
+    if args.claim is not None:
+        handle_claim(args)
+        return
+    if args.resolve is not None:
+        handle_resolve(args)
+        return
 
     # ストリーム モード: バックグラウンド ワーカーを起動して stream-id を出力します。
     if args.stream:

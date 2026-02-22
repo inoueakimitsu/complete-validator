@@ -1,0 +1,13 @@
+{
+  "name": "optimized",
+  "default_model": "haiku",
+  "max_workers": 4,
+  "batching": true,
+  "context_level": "smart",
+  "model": "haiku",
+  "parallelism": 6,
+  "cache": true,
+  "cost_weight": {
+    "miss_false_negative": 1.0
+  }
+}

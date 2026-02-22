@@ -1,0 +1,28 @@
+{
+  "fixture": "case_01_python_violations",
+  "mode": "baseline",
+  "generated_at": 1771725758,
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: main.py]\n## Violations Found\n\n**File: `main.py`**\n\n---\n\n### Rule: Naming style\n\n| Line | Violation | Detail |\n|------|-----------|--------|\n| 3 | `bad_function` | Explicitly listed placeholder/bad name — must be flagged. |\n| 3 | `x` | Single-letter parameter name; not a common loop index (`i`, `j`, `k`). |\n| 3 | `y` | Single-letter parameter name; not a common loop index (`i`, `j`, `k`). |\n| 5 | `'tmp'` | Placeholder string literal — technically a string value, not a variable name, but it matches the flagged placeholder `tmp`. **Needs confirmation** whether the rule applies to string literals or only to identifiers. |\n\n---\n\n**Checklist confirmation:** The single rule (Naming style) has been checked against the entire file content. All violations are reported above.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md.\n\n[Rule: readable_code/03_comments.md | File: main.py]\nNo violations found.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and re-run.\n",
+  "rule_results": [
+    {
+      "rule": "readable_code/02_naming.md",
+      "status": "deny",
+      "file": "main.py",
+      "message": "[Rule: readable_code/02_naming.md | File: main.py]"
+    },
+    {
+      "rule": "readable_code/03_comments.md",
+      "status": "allow",
+      "file": "main.py",
+      "message": "[Rule: readable_code/03_comments.md | File: main.py]"
+    }
+  ],
+  "raw": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: main.py]\n## Violations Found\n\n**File: `main.py`**\n\n---\n\n### Rule: Naming style\n\n| Line | Violation | Detail |\n|------|-----------|--------|\n| 3 | `bad_function` | Explicitly listed placeholder/bad name — must be flagged. |\n| 3 | `x` | Single-letter parameter name; not a common loop index (`i`, `j`, `k`). |\n| 3 | `y` | Single-letter parameter name; not a common loop index (`i`, `j`, `k`). |\n| 5 | `'tmp'` | Placeholder string literal — technically a string value, not a variable name, but it matches the flagged placeholder `tmp`. **Needs confirmation** whether the rule applies to string literals or only to identifiers. |\n\n---\n\n**Checklist confirmation:** The single rule (Naming style) has been checked against the entire file content. All violations are reported above.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md.\n\n[Rule: readable_code/03_comments.md | File: main.py]\nNo violations found.\n\n[Action Required]\nFix the violations above.\nIf any violation is a false positive, add a description to .complete-validator/suppressions.md and re-run.\n",
+    "config_path": "tests/configs/baseline.json"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "batched",
+  "batching": true,
+  "context_level": "diff",
+  "model": "haiku",
+  "parallelism": 4,
+  "cost_weight": {
+    "miss_false_negative": 1.2
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "fixture": "static/case_03_mixed_files",
+  "schema_version": "1",
+  "generator_version": "plan-driven-harness-v1",
+  "annotations": [
+    {
+      "rule": "readable_code/03_comments.md",
+      "file": "util.py",
+      "expected": "allow",
+      "description": "no comment issues in this fixture"
+    }
+  ]
+}

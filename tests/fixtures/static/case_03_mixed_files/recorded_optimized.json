@@ -1,0 +1,22 @@
+{
+  "fixture": "case_03_mixed_files",
+  "mode": "optimized",
+  "generated_at": 1771725809,
+  "exit_code": 0,
+  "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nNo violations found.\n",
+  "stderr": "",
+  "rule_results": [
+    {
+      "rule": "readable_code/02_naming.md",
+      "status": "allow",
+      "file": "util.py",
+      "message": "[Rule: readable_code/02_naming.md | File: util.py]"
+    }
+  ],
+  "raw": {
+    "exit_code": 0,
+    "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nNo violations found.\n",
+    "stderr": "",
+    "config_path": "tests/configs/optimized.json"
+  }
+}

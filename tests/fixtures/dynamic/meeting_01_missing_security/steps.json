@@ -1,0 +1,36 @@
+{
+  "description": "セキュリティ議論が抜けている会議",
+  "target_file": "meeting.transcript.md",
+  "interval_seconds": 5,
+  "steps": [
+    {
+      "step": 1,
+      "time_offset": 0,
+      "append": "## アジェンダ\n田中: リリース前の確認事項を決めます。\n"
+    },
+    {
+      "step": 2,
+      "time_offset": 5,
+      "append": "## 進捗報告\n鈴木: テスト実装を進めます。\n"
+    },
+    {
+      "step": 3,
+      "time_offset": 10,
+      "append": "## まとめ\n佐藤: 明日までにレビューします。\n"
+    }
+  ],
+  "annotations": [
+    {
+      "rule": "meeting_rules/security_discussion.md",
+      "file": "meeting.transcript.md",
+      "expected_by_step": {
+        "1": "irrelevant",
+        "2": "unsatisfied",
+        "3": "unsatisfied"
+      },
+      "expected": "unsatisfied",
+      "lock_on_satisfy": true,
+      "description": "security discussion missing at each step"
+    }
+  ]
+}

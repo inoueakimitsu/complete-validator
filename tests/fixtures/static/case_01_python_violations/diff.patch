@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: main.py
+@@
+-def bad_function(x,y):
+-    print('tmp')
+-    return x + y
++def bad_function(x, y):
++    if True:
++        print('tmp')
++    return x + y
+*** End Patch

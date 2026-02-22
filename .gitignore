@@ -1,1 +1,3 @@
 .complete-validator/
+__pycache__/
+tests/results/

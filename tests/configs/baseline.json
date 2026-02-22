@@ -1,0 +1,12 @@
+{
+  "name": "baseline",
+  "default_model": "sonnet",
+  "max_workers": 2,
+  "batching": false,
+  "context_level": "diff",
+  "model": "sonnet",
+  "parallelism": 4,
+  "cost_weight": {
+    "miss_false_negative": 1.0
+  }
+}

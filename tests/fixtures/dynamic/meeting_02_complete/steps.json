@@ -1,0 +1,36 @@
+{
+  "description": "セキュリティ議論ありの会議",
+  "target_file": "meeting.transcript.md",
+  "interval_seconds": 5,
+  "steps": [
+    {
+      "step": 1,
+      "time_offset": 0,
+      "append": "## アジェンダ\n本日の議題はリリース内容です。\n"
+    },
+    {
+      "step": 2,
+      "time_offset": 5,
+      "append": "## セキュリティ\n全員で脆弱性と対策を確認しました。\n"
+    },
+    {
+      "step": 3,
+      "time_offset": 10,
+      "append": "## まとめ\n全員、合意して次のステップへ。\n"
+    }
+  ],
+  "annotations": [
+    {
+      "rule": "meeting_rules/security_discussion.md",
+      "file": "meeting.transcript.md",
+      "expected_by_step": {
+        "1": "irrelevant",
+        "2": "satisfied",
+        "3": "satisfied"
+      },
+      "expected": "satisfied",
+      "lock_on_satisfy": true,
+      "description": "security was discussed"
+    }
+  ]
+}

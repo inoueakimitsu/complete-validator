@@ -193,6 +193,9 @@ python3 scripts/check_style.py --full-scan         # フル スキャン モー�
 python3 scripts/check_style.py --stream            # ストリーム モード
 python3 scripts/check_style.py --stream --staged   # ストリーム モード (staged)
 python3 scripts/check_style.py --full-scan --stream # ストリーム モード (フル スキャン)
+python3 scripts/check_style.py --list-violations <stream-id> # queue の pending/in_progress 一覧
+python3 scripts/check_style.py --claim <stream-id> <violation-id> # violation を claim
+python3 scripts/check_style.py --resolve <stream-id> <violation-id> --claim-uuid <uuid> --state-version <n> # claim 済み violation を resolve
 python3 scripts/check_style.py --plugin-dir DIR    # プラグイン ディレクトリを指定 (組み込みルールの場所)
 ```
 
@@ -403,6 +406,9 @@ cat .complete-validator/stream-results/<stream-id>/results/*.json
 
 # ワーカー ログ確認
 cat .complete-validator/stream-results/<stream-id>/worker.log
+
+# queue の未処理 violation を確認
+python3 scripts/check_style.py --list-violations <stream-id> --plugin-dir /path/to/complete-validator
 ```
 
 ### キャッシュ クリア
@@ -410,6 +416,59 @@ cat .complete-validator/stream-results/<stream-id>/worker.log
 ```bash
 rm -f .complete-validator/cache.json
 ```
+
+### テストハーネス
+
+```bash
+# static シナリオ
+python3 tests/test_harness.py --scenario static --config tests/configs/baseline.json
+
+# static 実行結果を recorded として保存
+python3 tests/test_harness.py --scenario static --config tests/configs/baseline.json --record
+
+# recorded を使って再実行 (録画が無い場合は失敗)
+python3 tests/test_harness.py --scenario static --config tests/configs/baseline.json --recorded
+
+# dynamic シナリオ (stream + claim/resolve)
+python3 tests/test_harness.py --scenario dynamic --config tests/configs/baseline.json
+python3 tests/test_harness.py --scenario dynamic --config tests/configs/optimized.json
+
+# 比較 (baseline vs optimized)
+python3 tests/test_harness.py --scenario static --config tests/configs/baseline.json tests/configs/optimized.json
+
+# 直近 2 結果の regression 比較
+python3 tests/test_harness.py --scenario regression
+
+# regression 失敗しきい値を変更 (F1 drop)
+python3 tests/test_harness.py --scenario regression --regression-max-drop 0.02
+python3 tests/test_harness.py --scenario regression --regression-scenario dynamic --regression-max-drop 0.02
+
+# 録画の更新と検証を一括実行
+bash tests/update_recordings.sh
+
+# 出力例
+# tests/results/static__baseline/summary.json
+# tests/results/static__optimized/summary.json
+# tests/results/dynamic__baseline/summary.json
+# tests/results/dynamic__optimized/summary.json
+```
+
+### ハーネス運用知見
+
+- `--recorded` は static 専用。録画が無い場合は失敗させる。
+- `No tracked files found.` を成功扱いにしない。fixture 側の Git 初期化不備として失敗させる。
+- dynamic 評価は `--list-violations` だけで判定しない。`stream-results/.../results/*.json` を一次ソースにする。
+- `lock_on_satisfy` 付きルールは step 間で satisfied 状態を保持して評価する。
+- baseline/optimized は別 config を必ず使い分ける。比較時に同一 config を再利用しない。
+- regression は scenario ごとに実行する: `static` と `dynamic` を分離。
+
+### ローカルゲート
+
+- API を使わない確認は `recorded` ベースでローカル実行する。
+- ワンコマンド: `bash tests/run_local_gate.sh`
+- regression の出力は scenario ごとに分離される:
+  - `tests/results/regression_static.json`
+  - `tests/results/regression_dynamic.json`
 
 ## プラグインの E2E テスト
 
