@@ -318,6 +318,60 @@ def test_watch_priority_from_recent_queue_returns_normal_without_matches(tmp_pat
     assert priority == check_style.WATCH_PRIORITY_NORMAL
 
 
+def test_watch_priority_from_result_quality_escalates_on_high_pending_ratio(tmp_path):
+    check_style = _load_check_style_module()
+    results_dir, _queue_dir = check_style._violations_dir(tmp_path)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, status in enumerate(["pending", "pending", "pending", "pending", "resolved"]):
+        payload = {
+            "schema_version": "1",
+            "run_id": "s1",
+            "id": f"id-{idx}",
+            "rule": "r.md",
+            "file": "notes.md",
+            "status": status,
+            "severity": "high" if status == "pending" else "medium",
+            "violations": [],
+            "detected_at": "2026-02-22T00:00:00Z",
+        }
+        check_style._write_json_atomically(results_dir / f"r-{idx}.json", payload)
+
+    priority = check_style._watch_priority_from_result_quality(
+        tmp_path,
+        ["notes.md"],
+        ttl_seconds=3600,
+    )
+    assert priority == check_style.WATCH_PRIORITY_HIGH
+
+
+def test_watch_priority_from_result_quality_returns_normal_on_low_pending_ratio(tmp_path):
+    check_style = _load_check_style_module()
+    results_dir, _queue_dir = check_style._violations_dir(tmp_path)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, status in enumerate(["resolved", "resolved", "resolved", "pending", "resolved"]):
+        payload = {
+            "schema_version": "1",
+            "run_id": "s1",
+            "id": f"id-{idx}",
+            "rule": "r.md",
+            "file": "notes.md",
+            "status": status,
+            "severity": "high" if status == "pending" else "medium",
+            "violations": [],
+            "detected_at": "2026-02-22T00:00:00Z",
+        }
+        check_style._write_json_atomically(results_dir / f"r-{idx}.json", payload)
+
+    priority = check_style._watch_priority_from_result_quality(
+        tmp_path,
+        ["notes.md"],
+        ttl_seconds=3600,
+    )
+    assert priority == check_style.WATCH_PRIORITY_NORMAL
+
+
 def test_watch_priority_from_history_stats_uses_recent_record(tmp_path):
     check_style = _load_check_style_module()
     now = 1_700_000_000.0

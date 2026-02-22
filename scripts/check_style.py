@@ -82,6 +82,7 @@ DEFAULT_WATCH_HISTORY_TTL_SECONDS = 3600
 DEFAULT_WATCH_TREND_WINDOW_SECONDS = 1800
 DEFAULT_WATCH_TREND_THRESHOLD_MEDIUM = 3
 DEFAULT_WATCH_TREND_THRESHOLD_HIGH = 6
+DEFAULT_WATCH_RESULT_QUALITY_WINDOW = 20
 WATCH_PRIORITY_HIGH = 0
 WATCH_PRIORITY_MEDIUM = 1
 WATCH_PRIORITY_NORMAL = 2
@@ -2254,6 +2255,55 @@ def _watch_priority_from_history_trend(
     return best
 
 
+def _watch_priority_from_result_quality(
+    root: Path,
+    target_files: list[str],
+    ttl_seconds: int,
+    sample_limit: int = DEFAULT_WATCH_RESULT_QUALITY_WINDOW,
+) -> int:
+    """直近の実検出結果 (pending 比率) から watch 優先度を推定します。"""
+    if not target_files:
+        return WATCH_PRIORITY_NORMAL
+    results_dir, _queue_dir = _violations_dir(root)
+    if not results_dir.exists():
+        return WATCH_PRIORITY_NORMAL
+
+    target_set = set(target_files)
+    now = time.time()
+    pending_like_count = 0
+    sample_count = 0
+
+    result_paths = [p for p in results_dir.glob("*.json") if p.is_file()]
+    result_paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for path in result_paths:
+        if sample_count >= sample_limit:
+            break
+        age = now - path.stat().st_mtime
+        if ttl_seconds > 0 and age > ttl_seconds:
+            continue
+        data = _read_json_file(path)
+        if not isinstance(data, dict):
+            continue
+        file_path = str(data.get("file", ""))
+        if file_path not in target_set:
+            continue
+        status = str(data.get("status", "")).strip().lower()
+        sample_count += 1
+        if status in {"pending", "in_progress", "manual_review", "stale"}:
+            pending_like_count += 1
+
+    if sample_count == 0:
+        return WATCH_PRIORITY_NORMAL
+
+    pending_ratio = pending_like_count / sample_count
+    if pending_like_count >= 3 and pending_ratio >= 0.6:
+        return WATCH_PRIORITY_HIGH
+    if pending_like_count >= 2 and pending_ratio >= 0.3:
+        return WATCH_PRIORITY_MEDIUM
+    return WATCH_PRIORITY_NORMAL
+
+
 def _update_watch_priority_stats(root: Path, target_files: list[str], priority: int) -> None:
     if not target_files:
         return
@@ -2409,6 +2459,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
             _watch_priority_from_diff(diff_chunks),
             _watch_priority_from_rule_severity(target_files, rules),
             _watch_priority_from_recent_queue(root, target_files),
+            _watch_priority_from_result_quality(root, target_files, history_ttl),
             _watch_priority_from_history_stats(root, target_files, history_ttl),
             _watch_priority_from_history_trend(root, target_files, history_ttl),
         )
