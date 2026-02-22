@@ -618,6 +618,49 @@ def _force_expired_to_pending(queue_dir: Path, now_ts: float) -> int:
     return changed
 
 
+def _mark_non_current_runs_stale(queue_dir: Path, current_stream_id: str, now_ts: float) -> int:
+    """現在 stream 以外の未解決 queue state を stale に遷移します。
+
+    Parameters
+    ----------
+    queue_dir: Path
+        queue state ディレクトリです。
+    current_stream_id: str
+        現在処理中の stream-id です。
+    now_ts: float
+        現在時刻 (epoch 秒) です。
+
+    Returns
+    -------
+    int
+        stale 化した件数です。
+    """
+    changed = 0
+    stale_candidates = _list_queue_states(
+        queue_dir,
+        statuses={ViolationStatus.PENDING, ViolationStatus.IN_PROGRESS, ViolationStatus.MANUAL_REVIEW},
+    )
+    for path, data, _priority, status in stale_candidates:
+        if data.get("run_id") == current_stream_id:
+            continue
+        next_state = dict(data)
+        next_state["status"] = ViolationStatus.STALE.value
+        next_state["state_version"] = int(data.get("state_version", 0)) + 1
+        next_state["stale_at"] = _now_iso8601()
+        next_state["stale_reason"] = "older_stream_detected"
+        next_state["updated_at"] = _now_iso8601()
+        if status == ViolationStatus.IN_PROGRESS or _is_lease_expired(data, now_ts):
+            next_state["lease_expires_at"] = None
+            next_state["claimed_at"] = None
+            next_state["claim_uuid"] = None
+            next_state["owner"] = None
+        stale_priority = _severity_priority(data.get("severity", ""))
+        stale_path = _queue_state_path(queue_dir, data.get("id", ""), ViolationStatus.STALE, stale_priority)
+        if _replace_state_file(path, stale_path, next_state):
+            changed += 1
+    return changed
+
+
 def _list_violations_for_queue(
     stream_id: str,
     statuses: set[ViolationStatus] | None = None,
@@ -627,6 +670,7 @@ def _list_violations_for_queue(
     _, queue_dir = _violations_dir(root)
     now_ts = _now_timestamp()
     _force_expired_to_pending(queue_dir, now_ts)
+    _mark_non_current_runs_stale(queue_dir, stream_id, now_ts)
 
     status_filter = (
         statuses

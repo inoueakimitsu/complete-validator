@@ -986,6 +986,9 @@ sequenceDiagram
   - `claim_uuid` + `state_version` で resolve CAS
   - lease 期限切れは `_force_expired_to_pending()` で回収
   - 同一 target file の二重 in-progress は claim 時に拒否
+- stale 再評価:
+  - `--list-violations <current-stream-id>` 実行時に、他 stream の未解決状態 (`pending` / `in_progress` / `manual_review`) を `stale` に遷移する。
+  - `stale` 化されたエントリには `stale_reason: older_stream_detected` を記録し、現行 stream の未処理キューからは除外する。
 
 ### 主要エントリポイント (運用コマンド)
 
@@ -999,6 +1002,7 @@ python3 scripts/check_style.py --full-scan
 python3 scripts/check_style.py --stream --plugin-dir /path/to/complete-validator
 python3 scripts/check_style.py --list-violations <stream-id>
 python3 scripts/check_style.py --claim <stream-id> <violation-id>
+python3 scripts/check_style.py --heartbeat <stream-id> <violation-id> --claim-uuid <uuid> --state-version <n>
 python3 scripts/check_style.py --resolve <stream-id> <violation-id> --claim-uuid <uuid> --state-version <n>
 
 # ローカルゲート (API不要)
@@ -1011,7 +1015,7 @@ bash tests/update_recordings.sh
 ### オンボーディング最短手順 (背景知識なし想定)
 
 1. `CLAUDE.md` の「実装同期リファレンス」を先に読む。
-2. `scripts/check_style.py` の `main()` / `main_stream()` / `main_stream_worker()` / `handle_claim()` / `handle_resolve()` を追う。
+2. `scripts/check_style.py` の `main()` / `main_stream()` / `main_stream_worker()` / `handle_claim()` / `handle_heartbeat()` / `handle_resolve()` を追う。
 3. `tests/test_harness.py` の `run_static()` / `run_dynamic()` / `run_regression()` を追う。
 4. `bash tests/run_local_gate.sh` を実行し、ローカルで回帰ゲートが通ることを確認する。
 5. 変更時は本セクションの図・データモデル・運用コマンドを同時更新する。
@@ -1037,7 +1041,8 @@ bash tests/update_recordings.sh
 
 - 生データは `.complete-validator/violations/results/*.json` に追記される。
 - 作業状態は `.complete-validator/violations/queue/*.state.json` で管理する。
-- `--claim` / `--resolve` は queue state のみを更新する。
+- `--claim` / `--heartbeat` / `--resolve` は queue state のみを更新する。
+- `--list-violations` は現行 stream 以外の未解決 queue state を `stale` に遷移し、古い検出結果を再評価対象として分離する。
 
 この分離により、再チェックで検出結果が更新されても、修正中の claim 状態が壊れにくくなっています。
 
