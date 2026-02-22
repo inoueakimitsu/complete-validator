@@ -146,6 +146,44 @@ def test_unlock_by_change_symbol_does_not_release_on_non_matching_identifier():
     assert streaks["meeting_rules/security_discussion.md"] == 1
 
 
+def test_unlock_by_evidence_terms_releases_lock_when_change_hits_evidence():
+    harness = _load_test_harness_module()
+    locked = {"meeting_rules/security_discussion.md"}
+    streaks = {"meeting_rules/security_discussion.md": 1}
+    evidence = {"meeting_rules/security_discussion.md": {"auth", "token"}}
+
+    harness._apply_lock_unlock_by_change(
+        append_text="Authentication policy now requires rotating credentials.",
+        locked_rules=locked,
+        deny_streaks=streaks,
+        unlock_on_change_keywords={},
+        unlock_on_change_symbols={},
+        lock_evidence_terms=evidence,
+    )
+
+    assert "meeting_rules/security_discussion.md" not in locked
+    assert streaks["meeting_rules/security_discussion.md"] == 0
+
+
+def test_unlock_by_evidence_terms_keeps_lock_when_change_is_unrelated():
+    harness = _load_test_harness_module()
+    locked = {"meeting_rules/security_discussion.md"}
+    streaks = {"meeting_rules/security_discussion.md": 1}
+    evidence = {"meeting_rules/security_discussion.md": {"auth", "token"}}
+
+    harness._apply_lock_unlock_by_change(
+        append_text="Added attendee list and next meeting schedule.",
+        locked_rules=locked,
+        deny_streaks=streaks,
+        unlock_on_change_keywords={},
+        unlock_on_change_symbols={},
+        lock_evidence_terms=evidence,
+    )
+
+    assert "meeting_rules/security_discussion.md" in locked
+    assert streaks["meeting_rules/security_discussion.md"] == 1
+
+
 def test_extract_changed_symbols_includes_ast_nodes():
     harness = _load_test_harness_module()
     symbols = harness._extract_changed_symbols(

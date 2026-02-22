@@ -152,6 +152,7 @@ def _apply_lock_hysteresis(
     locked_rules: set[str],
     deny_streaks: dict[str, int],
     unlock_hysteresis: int,
+    lock_evidence_terms: dict[str, set[str]] | None = None,
 ) -> None:
     if not rule_results or not lockable_rules:
         return
@@ -178,6 +179,8 @@ def _apply_lock_hysteresis(
                 else:
                     locked_rules.discard(rule_name)
                     deny_streaks[rule_name] = 0
+                    if lock_evidence_terms is not None:
+                        lock_evidence_terms.pop(rule_name, None)
             else:
                 deny_streaks[rule_name] = 0
                 for i in indexes:
@@ -187,6 +190,12 @@ def _apply_lock_hysteresis(
         if has_allow and not has_deny:
             locked_rules.add(rule_name)
             deny_streaks[rule_name] = 0
+            if lock_evidence_terms is not None:
+                lock_evidence_terms[rule_name] = _collect_lock_evidence_terms(
+                    rule_name=rule_name,
+                    rule_results=rule_results,
+                    indexes=indexes,
+                )
 
 
 def _apply_lock_unlock_by_change(
@@ -195,6 +204,7 @@ def _apply_lock_unlock_by_change(
     deny_streaks: dict[str, int],
     unlock_on_change_keywords: dict[str, list[str]],
     unlock_on_change_symbols: dict[str, list[str]],
+    lock_evidence_terms: dict[str, set[str]] | None = None,
 ) -> None:
     if not locked_rules:
         return
@@ -202,14 +212,23 @@ def _apply_lock_unlock_by_change(
     if not changed:
         return
     changed_identifiers = _extract_changed_symbols(append_text or "")
+    changed_terms = _extract_changed_terms(append_text or "")
     for rule_name in list(locked_rules):
         keywords = unlock_on_change_keywords.get(rule_name, [])
         symbols = unlock_on_change_symbols.get(rule_name, [])
         keyword_match = any(keyword in changed for keyword in keywords)
         symbol_match = any(symbol in changed_identifiers for symbol in symbols)
-        if keyword_match or symbol_match:
+        evidence_terms = (
+            {_normalize_semantic_term(term) for term in lock_evidence_terms.get(rule_name, set())}
+            if isinstance(lock_evidence_terms, dict)
+            else set()
+        )
+        evidence_match = bool(evidence_terms and evidence_terms.intersection(changed_terms))
+        if keyword_match or symbol_match or evidence_match:
             locked_rules.discard(rule_name)
             deny_streaks[rule_name] = 0
+            if isinstance(lock_evidence_terms, dict):
+                lock_evidence_terms.pop(rule_name, None)
 
 
 def _extract_changed_symbols(append_text: str) -> set[str]:
@@ -235,6 +254,65 @@ def _extract_changed_symbols(append_text: str) -> set[str]:
         elif isinstance(node, ast.Attribute):
             symbols.add(node.attr)
     return symbols
+
+
+SEMANTIC_EQUIVALENTS = {
+    "authentication": "auth",
+    "authenticate": "auth",
+    "authorization": "auth",
+    "authorise": "auth",
+    "authorize": "auth",
+    "login": "auth",
+    "credentials": "token",
+    "credential": "token",
+    "tokens": "token",
+}
+SEMANTIC_STOPWORDS = {
+    "the",
+    "and",
+    "with",
+    "from",
+    "into",
+    "this",
+    "that",
+    "added",
+    "requires",
+    "meeting",
+    "notes",
+}
+
+
+def _normalize_semantic_term(term: str) -> str:
+    lowered = str(term or "").strip().lower()
+    if not lowered:
+        return ""
+    return SEMANTIC_EQUIVALENTS.get(lowered, lowered)
+
+
+def _extract_changed_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for token in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", text or ""):
+        normalized = _normalize_semantic_term(token)
+        if not normalized or normalized in SEMANTIC_STOPWORDS:
+            continue
+        terms.add(normalized)
+    return terms
+
+
+def _collect_lock_evidence_terms(
+    rule_name: str,
+    rule_results: list[dict],
+    indexes: list[int],
+) -> set[str]:
+    terms: set[str] = set()
+    terms.update(_extract_changed_terms(rule_name.replace("/", " ")))
+    for idx in indexes:
+        item = rule_results[idx]
+        message = str(item.get("message", ""))
+        file_path = str(item.get("file", ""))
+        terms.update(_extract_changed_terms(message))
+        terms.update(_extract_changed_terms(file_path.replace("/", " ")))
+    return terms
 
 
 def _sanitize_recorded_payload(payload: dict) -> dict:
@@ -660,6 +738,7 @@ def run_dynamic(
                     unlock_on_change_symbols[rule_name] = normalized_symbols
         locked_rules: set[str] = set()
         lock_deny_streaks: dict[str, int] = {}
+        lock_evidence_terms: dict[str, set[str]] = {}
         try:
             target_path = work_dir / fixture.target_file
             for step_item in fixture.steps:
@@ -672,6 +751,7 @@ def run_dynamic(
                     deny_streaks=lock_deny_streaks,
                     unlock_on_change_keywords=unlock_on_change_keywords,
                     unlock_on_change_symbols=unlock_on_change_symbols,
+                    lock_evidence_terms=lock_evidence_terms,
                 )
 
                 stream_id, entries = _run_stream_once(work_dir, runner_cfg, plugin_dir, wait_seconds)
@@ -710,6 +790,7 @@ def run_dynamic(
                     locked_rules=locked_rules,
                     deny_streaks=lock_deny_streaks,
                     unlock_hysteresis=lock_unlock_hysteresis,
+                    lock_evidence_terms=lock_evidence_terms,
                 )
 
                 metrics = evaluate_fixture(fixture, result, step=step_no)
@@ -724,6 +805,7 @@ def run_dynamic(
                         "manual_review_required": manual_review_required,
                         "oscillation_hits": oscillation_hits,
                         "locked_rules": sorted(locked_rules),
+                        "lock_evidence_terms": {k: sorted(v) for k, v in lock_evidence_terms.items()},
                         "lock_deny_streaks": dict(lock_deny_streaks),
                         "rule_results": result.rule_results,
                     },
