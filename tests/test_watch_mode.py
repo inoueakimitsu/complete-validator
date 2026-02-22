@@ -75,9 +75,10 @@ def test_run_watch_mode_triggers_once_and_stops(monkeypatch):
         calls["idx"] += 1
         return sequence[i]
 
-    def fake_run(cmd, check=False):
-        calls["run"] += 1
-        return argparse.Namespace(returncode=0)
+    def fake_run(cmd, check=False, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] != "git":
+            calls["run"] += 1
+        return argparse.Namespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(check_style, "resolve_target_files", fake_resolve_target_files)
     monkeypatch.setattr(check_style.subprocess, "run", fake_run)
@@ -255,3 +256,60 @@ def test_watch_priority_combines_rule_severity_and_diff_keywords():
         check_style._watch_priority_from_rule_severity(target_files, rules),
     )
     assert combined == check_style.WATCH_PRIORITY_MEDIUM
+
+
+def test_watch_priority_from_recent_queue_uses_highest_severity(tmp_path):
+    check_style = _load_check_style_module()
+    _results_dir, queue_dir = check_style._violations_dir(tmp_path)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+
+    low_id = "1" * 64
+    high_id = "2" * 64
+    low_path = check_style._queue_state_path(queue_dir, low_id, check_style.ViolationStatus.PENDING, 300)
+    high_path = check_style._queue_state_path(queue_dir, high_id, check_style.ViolationStatus.PENDING, 100)
+
+    check_style._write_json_atomically(
+        low_path,
+        {
+            "id": low_id,
+            "run_id": "s1",
+            "target_file_path": "notes.md",
+            "severity": "low",
+            "status": "pending",
+        },
+    )
+    check_style._write_json_atomically(
+        high_path,
+        {
+            "id": high_id,
+            "run_id": "s1",
+            "target_file_path": "notes.md",
+            "severity": "high",
+            "status": "pending",
+        },
+    )
+
+    priority = check_style._watch_priority_from_recent_queue(tmp_path, ["notes.md"])
+    assert priority == check_style.WATCH_PRIORITY_HIGH
+
+
+def test_watch_priority_from_recent_queue_returns_normal_without_matches(tmp_path):
+    check_style = _load_check_style_module()
+    _results_dir, queue_dir = check_style._violations_dir(tmp_path)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+
+    other_id = "3" * 64
+    other_path = check_style._queue_state_path(queue_dir, other_id, check_style.ViolationStatus.PENDING, 100)
+    check_style._write_json_atomically(
+        other_path,
+        {
+            "id": other_id,
+            "run_id": "s1",
+            "target_file_path": "other.md",
+            "severity": "high",
+            "status": "pending",
+        },
+    )
+
+    priority = check_style._watch_priority_from_recent_queue(tmp_path, ["notes.md"])
+    assert priority == check_style.WATCH_PRIORITY_NORMAL

@@ -2141,6 +2141,28 @@ def _watch_priority_from_rule_severity(target_files: list[str], rules: RuleList)
     return best
 
 
+def _watch_priority_from_recent_queue(root: Path, target_files: list[str]) -> int:
+    if not target_files:
+        return WATCH_PRIORITY_NORMAL
+    _results_dir, queue_dir = _violations_dir(root)
+    if not queue_dir.exists():
+        return WATCH_PRIORITY_NORMAL
+
+    target_set = set(target_files)
+    best = WATCH_PRIORITY_NORMAL
+    for _path, state, _priority, _status in _list_queue_states(queue_dir):
+        state_target = str(state.get("target_file_path", ""))
+        if state_target not in target_set:
+            continue
+        severity = str(state.get("severity", "")).strip().lower()
+        state_priority = _severity_to_watch_priority(severity)
+        if state_priority < best:
+            best = state_priority
+            if best == WATCH_PRIORITY_HIGH:
+                return best
+    return best
+
+
 def build_watch_check_command(args: argparse.Namespace) -> list[str]:
     cmd = [sys.executable, __file__]
     if args.staged:
@@ -2250,6 +2272,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     reinsert_delay = max(0.1, float(args.watch_reinsert_delay_seconds))
 
     command = build_watch_check_command(args)
+    root = _repository_root()
     project_dirs = find_project_rules_dirs()
     builtin_dir = args.plugin_dir / "rules" if args.plugin_dir else None
     rules, _warnings = merge_rules(builtin_dir, project_dirs)
@@ -2264,6 +2287,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
         current_priority = min(
             _watch_priority_from_diff(diff_chunks),
             _watch_priority_from_rule_severity(target_files, rules),
+            _watch_priority_from_recent_queue(root, target_files),
         )
         now = time.monotonic()
         _watch_restore_delayed_signatures(pending_queue, delayed_queue, now, queue_max)
