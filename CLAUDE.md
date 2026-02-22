@@ -358,6 +358,7 @@ applies_to: ["*.py", "*.md"]
 | `decision_log` | array | 設定変更の履歴 (監査用途)。 |
 
 環境変数 `RULE_VALIDATOR_RULE_CONFIG_PATH` で保存先を明示指定できます。
+`scripts/check_style.py` には監査ログ追記 API `append_rule_config_decision()` を実装済みで、`decision_id` / `changed_by` / `reason` / `metrics_snapshot` / `timestamp` を必須情報として永続化できます。
 
 ## 偽陽性の抑制 (suppressions)
 

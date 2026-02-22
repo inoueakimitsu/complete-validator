@@ -72,6 +72,184 @@ DEFAULT_MAX_WORKERS = 4
 DEFAULT_MODEL = "sonnet"
 # キャッシュ TTL のデフォルト (秒) です。既定は 7 日です。
 DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_RULE_CONFIG_VERSION = 1
+
+
+def _default_rule_config() -> dict:
+    return {
+        "version": DEFAULT_RULE_CONFIG_VERSION,
+        "rules": {},
+        "decision_log": [],
+    }
+
+
+def _rule_config_path(config_dir: Path) -> Path:
+    explicit_path = os.environ.get("RULE_VALIDATOR_RULE_CONFIG_PATH")
+    if explicit_path:
+        return Path(explicit_path)
+    return config_dir / ".complete-validator" / "rule-config.json"
+
+
+def _normalize_rule_config(raw: dict | None) -> dict:
+    base = _default_rule_config()
+    if not isinstance(raw, dict):
+        return base
+
+    version = raw.get("version")
+    if isinstance(version, int) and version > 0:
+        base["version"] = version
+
+    rules = raw.get("rules")
+    if isinstance(rules, dict):
+        normalized_rules: dict[str, dict] = {}
+        for key, value in rules.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            normalized_rules[key] = dict(value)
+        base["rules"] = normalized_rules
+
+    decision_log = raw.get("decision_log")
+    if isinstance(decision_log, list):
+        normalized_log: list[dict] = []
+        for entry in decision_log:
+            if isinstance(entry, dict):
+                normalized_log.append(dict(entry))
+        base["decision_log"] = normalized_log
+
+    return base
+
+
+def load_rule_config(config_dir: Path) -> dict:
+    """rule-config.json を読み込み、未設定/破損時はデフォルト構造を返します。
+
+    Parameters
+    ----------
+    config_dir: Path
+        ``.complete-validator/`` を探すディレクトリです (通常は git toplevel)。
+
+    Returns
+    -------
+    dict
+        正規化済み rule-config 辞書です。
+    """
+    config_path = _rule_config_path(config_dir)
+    if not config_path.exists():
+        return _default_rule_config()
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return _default_rule_config()
+    return _normalize_rule_config(raw)
+
+
+def save_rule_config(config_dir: Path, rule_config: dict) -> Path:
+    """rule-config.json を原子的に保存します。
+
+    Parameters
+    ----------
+    config_dir: Path
+        ``.complete-validator/`` を探すディレクトリです (通常は git toplevel)。
+    rule_config: dict
+        保存対象の rule-config 辞書です。保存前に正規化します。
+
+    Returns
+    -------
+    Path
+        保存先ファイルパスです。
+    """
+    config_path = _rule_config_path(config_dir)
+    _write_json_atomically(config_path, _normalize_rule_config(rule_config))
+    return config_path
+
+
+def append_rule_config_decision(
+    config_dir: Path,
+    rule_key: str,
+    updates: dict | None,
+    *,
+    changed_by: str,
+    reason: str,
+    metrics_snapshot: dict,
+    decision_id: str | None = None,
+    timestamp: str | None = None,
+) -> tuple[Path, dict]:
+    """rule-config の設定更新と監査ログ追記を同時に永続化します。
+
+    Parameters
+    ----------
+    config_dir: Path
+        ``.complete-validator/`` を探すディレクトリです (通常は git toplevel)。
+    rule_key: str
+        変更対象ルールのキーです (例: ``readable_code/02_naming.md``)。
+    updates: dict | None
+        当該ルールへ反映する設定差分です。``None`` の場合はルール設定を更新しません。
+    changed_by: str
+        変更主体です (例: ``auto_tuning``、``manual``)。
+    reason: str
+        設定変更理由です。
+    metrics_snapshot: dict
+        変更判断に使ったメトリクスです。
+    decision_id: str | None
+        監査ログの一意 ID。未指定時は自動生成します。
+    timestamp: str | None
+        監査ログ時刻。未指定時は現在時刻を使用します。
+
+    Returns
+    -------
+    tuple[Path, dict]
+        ``(保存先パス, 追記した decision エントリ)`` を返します。
+    """
+    normalized_rule_key = rule_key.strip() if isinstance(rule_key, str) else ""
+    normalized_changed_by = changed_by.strip() if isinstance(changed_by, str) else ""
+    normalized_reason = reason.strip() if isinstance(reason, str) else ""
+    if not normalized_rule_key:
+        raise ValueError("rule_key must be a non-empty string")
+    if not normalized_changed_by:
+        raise ValueError("changed_by must be a non-empty string")
+    if not normalized_reason:
+        raise ValueError("reason must be a non-empty string")
+    if not isinstance(metrics_snapshot, dict):
+        raise ValueError("metrics_snapshot must be a dict")
+    if updates is not None and not isinstance(updates, dict):
+        raise ValueError("updates must be a dict or None")
+
+    now_iso = timestamp if isinstance(timestamp, str) and timestamp.strip() else _now_iso8601()
+    decision = {
+        "decision_id": (
+            decision_id.strip()
+            if isinstance(decision_id, str) and decision_id.strip()
+            else f"{time.strftime('%Y%m%d-%H%M%S')}-tune-{uuid4().hex[:8]}"
+        ),
+        "rule_key": normalized_rule_key,
+        "changed_by": normalized_changed_by,
+        "reason": normalized_reason,
+        "metrics_snapshot": dict(metrics_snapshot),
+        "timestamp": now_iso,
+    }
+    if isinstance(updates, dict) and updates:
+        decision["updates"] = dict(updates)
+
+    rule_config = load_rule_config(config_dir)
+    rules = rule_config.get("rules", {})
+    if not isinstance(rules, dict):
+        rules = {}
+    if updates is not None:
+        prev = rules.get(normalized_rule_key, {})
+        if not isinstance(prev, dict):
+            prev = {}
+        merged = dict(prev)
+        merged.update(updates)
+        rules[normalized_rule_key] = merged
+    rule_config["rules"] = rules
+
+    decision_log = rule_config.get("decision_log", [])
+    if not isinstance(decision_log, list):
+        decision_log = []
+    decision_log.append(decision)
+    rule_config["decision_log"] = decision_log
+
+    config_path = save_rule_config(config_dir, rule_config)
+    return config_path, decision
 
 
 def load_config(config_dir: Path) -> dict:
@@ -2454,6 +2632,7 @@ def main_stream_worker(args: argparse.Namespace) -> None:
         return
 
     config = load_config(cache_dir)
+    _rule_config = load_rule_config(cache_dir)
     suppressions = load_suppressions(cache_dir)
     cache = CacheStore(
         path=cache_dir / ".complete-validator" / "cache.json",
@@ -2546,6 +2725,7 @@ def main() -> None:
 
     # ファイル内容を読み込みます。
     config = load_config(cache_dir)
+    _rule_config = load_rule_config(cache_dir)
     suppressions = load_suppressions(cache_dir)
     cache = CacheStore(
         path=cache_dir / ".complete-validator" / "cache.json",
