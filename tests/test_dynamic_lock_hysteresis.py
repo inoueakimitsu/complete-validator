@@ -144,3 +144,24 @@ def test_unlock_by_change_symbol_does_not_release_on_non_matching_identifier():
 
     assert "meeting_rules/security_discussion.md" in locked
     assert streaks["meeting_rules/security_discussion.md"] == 1
+
+
+def test_extract_changed_symbols_includes_ast_nodes():
+    harness = _load_test_harness_module()
+    symbols = harness._extract_changed_symbols(
+        "class TokenGuard:\n"
+        "    def validate_token(self, token):\n"
+        "        return self.policy.check(token)\n"
+    )
+
+    assert "TokenGuard" in symbols
+    assert "validate_token" in symbols
+    assert "policy" in symbols
+    assert "check" in symbols
+
+
+def test_extract_changed_symbols_fallback_on_syntax_error():
+    harness = _load_test_harness_module()
+    symbols = harness._extract_changed_symbols("validate_token(")
+
+    assert "validate_token" in symbols

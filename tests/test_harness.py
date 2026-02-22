@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import keyword
 import os
@@ -200,11 +201,7 @@ def _apply_lock_unlock_by_change(
     changed = (append_text or "").lower()
     if not changed:
         return
-    changed_identifiers = {
-        token
-        for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", append_text or "")
-        if token and not keyword.iskeyword(token)
-    }
+    changed_identifiers = _extract_changed_symbols(append_text or "")
     for rule_name in list(locked_rules):
         keywords = unlock_on_change_keywords.get(rule_name, [])
         symbols = unlock_on_change_symbols.get(rule_name, [])
@@ -213,6 +210,31 @@ def _apply_lock_unlock_by_change(
         if keyword_match or symbol_match:
             locked_rules.discard(rule_name)
             deny_streaks[rule_name] = 0
+
+
+def _extract_changed_symbols(append_text: str) -> set[str]:
+    symbols: set[str] = set()
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", append_text or ""):
+        if token and not keyword.iskeyword(token):
+            symbols.add(token)
+
+    try:
+        tree = ast.parse(append_text or "")
+    except SyntaxError:
+        return symbols
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            symbols.add(node.name)
+        elif isinstance(node, ast.AsyncFunctionDef):
+            symbols.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            symbols.add(node.name)
+        elif isinstance(node, ast.Name):
+            symbols.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            symbols.add(node.attr)
+    return symbols
 
 
 def _sanitize_recorded_payload(payload: dict) -> dict:
