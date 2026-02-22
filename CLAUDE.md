@@ -454,6 +454,8 @@ bash tests/update_recordings.sh
 # tests/results/static__optimized/summary.json
 # tests/results/dynamic__baseline/summary.json
 # tests/results/dynamic__optimized/summary.json
+# summary.json には objective_proxies を含む:
+#   c_monetary_proxy / c_time_proxy / c_false_negative_proxy / c_disruption_proxy
 ```
 
 ### ハーネス運用知見

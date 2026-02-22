@@ -667,11 +667,32 @@ def print_and_persist(
     root: Path,
 ) -> None:
     print_summary(f"Scenario:{scenario} Config:{config_name}", metrics, timing)
+    objective_proxies = {
+        "c_monetary_proxy": {
+            "llm_calls": timing.get("llm_calls", 0),
+            "model": config_name,
+        },
+        "c_time_proxy": {
+            "wall_time": timing.get("wall_time", 0.0),
+            "mode": timing.get("mode", "unknown"),
+        },
+        "c_false_negative_proxy": {
+            "fn": metrics.get("fn", 0),
+            "recall": metrics.get("recall", 0.0),
+            "f1": metrics.get("f1", 0.0),
+        },
+        "c_disruption_proxy": {
+            "disruption_rate": metrics.get("disruption_rate", 0.0),
+            "fp": metrics.get("fp", 0),
+            "tn": metrics.get("tn", 0),
+        },
+    }
     output = {
         "scenario": scenario,
         "config": config_name,
         "metrics": metrics,
         "timing": timing,
+        "objective_proxies": objective_proxies,
         "details": details,
     }
     out_dir = root / "tests" / "results" / f"{scenario}__{config_name}"
