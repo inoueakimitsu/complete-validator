@@ -61,6 +61,12 @@ def parse_args() -> argparse.Namespace:
         help="number of repeated signatures allowed before manual_review_required",
     )
     parser.add_argument(
+        "--lock-unlock-hysteresis",
+        type=int,
+        default=2,
+        help="consecutive deny count required to unlock lock_on_satisfy rules",
+    )
+    parser.add_argument(
         "--regression-max-drop",
         type=float,
         default=0.05,
@@ -135,6 +141,49 @@ def _entries_signature(entries: list[dict]) -> str:
         )
     compact.sort()
     return json.dumps(compact, ensure_ascii=False)
+
+
+def _apply_lock_hysteresis(
+    rule_results: list[dict],
+    lockable_rules: set[str],
+    locked_rules: set[str],
+    deny_streaks: dict[str, int],
+    unlock_hysteresis: int,
+) -> None:
+    if not rule_results or not lockable_rules:
+        return
+    threshold = max(1, int(unlock_hysteresis))
+    by_rule: dict[str, list[int]] = {}
+    for idx, item in enumerate(rule_results):
+        rule_name = str(item.get("rule", ""))
+        by_rule.setdefault(rule_name, []).append(idx)
+
+    for rule_name, indexes in by_rule.items():
+        if rule_name not in lockable_rules:
+            continue
+        statuses = [str(rule_results[i].get("status", "allow")).lower() for i in indexes]
+        has_allow = any(status == "allow" for status in statuses)
+        has_deny = any(status == "deny" for status in statuses)
+
+        if rule_name in locked_rules:
+            if has_deny:
+                next_streak = int(deny_streaks.get(rule_name, 0)) + 1
+                deny_streaks[rule_name] = next_streak
+                if next_streak < threshold:
+                    for i in indexes:
+                        rule_results[i]["status"] = "allow"
+                else:
+                    locked_rules.discard(rule_name)
+                    deny_streaks[rule_name] = 0
+            else:
+                deny_streaks[rule_name] = 0
+                for i in indexes:
+                    rule_results[i]["status"] = "allow"
+            continue
+
+        if has_allow and not has_deny:
+            locked_rules.add(rule_name)
+            deny_streaks[rule_name] = 0
 
 
 def _sanitize_recorded_payload(payload: dict) -> dict:
@@ -517,6 +566,7 @@ def run_dynamic(
     wait_seconds: int,
     max_fixpoint_iterations: int = 3,
     oscillation_limit: int = 1,
+    lock_unlock_hysteresis: int = 2,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     fm = FixtureManager(runner_cfg.root / "tests" / "fixtures")
     dynamic_fixtures = fm.list_dynamic_fixtures(fixture_filter)
@@ -541,6 +591,7 @@ def run_dynamic(
             if isinstance(ann, dict) and ann.get("lock_on_satisfy")
         }
         locked_rules: set[str] = set()
+        lock_deny_streaks: dict[str, int] = {}
         try:
             target_path = work_dir / fixture.target_file
             for step_item in fixture.steps:
@@ -578,14 +629,13 @@ def run_dynamic(
                 step_no = int(step_item.get("step", 0))
                 result = _to_check_result(fixture.name, final_entries, final_stream_id)
 
-                for item in result.rule_results:
-                    rule_name = str(item.get("rule", ""))
-                    if rule_name in locked_rules:
-                        item["status"] = "allow"
-                for item in result.rule_results:
-                    rule_name = str(item.get("rule", ""))
-                    if rule_name in lockable_rules and str(item.get("status", "allow")).lower() == "allow":
-                        locked_rules.add(rule_name)
+                _apply_lock_hysteresis(
+                    rule_results=result.rule_results,
+                    lockable_rules=lockable_rules,
+                    locked_rules=locked_rules,
+                    deny_streaks=lock_deny_streaks,
+                    unlock_hysteresis=lock_unlock_hysteresis,
+                )
 
                 metrics = evaluate_fixture(fixture, result, step=step_no)
                 metrics_list.append(metrics)
@@ -598,6 +648,8 @@ def run_dynamic(
                         "fixpoint_iterations": fixpoint_iterations,
                         "manual_review_required": manual_review_required,
                         "oscillation_hits": oscillation_hits,
+                        "locked_rules": sorted(locked_rules),
+                        "lock_deny_streaks": dict(lock_deny_streaks),
                         "rule_results": result.rule_results,
                     },
                 )
@@ -821,6 +873,7 @@ def main() -> None:
             args.wait_seconds,
             max_fixpoint_iterations=args.max_fixpoint_iterations,
             oscillation_limit=args.oscillation_limit,
+            lock_unlock_hysteresis=args.lock_unlock_hysteresis,
         )
         print_and_persist(
             scenario=args.scenario,
