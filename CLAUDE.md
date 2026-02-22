@@ -468,6 +468,10 @@ bash tests/update_recordings.sh
 - baseline/optimized は別 config を必ず使い分ける。比較時に同一 config を再利用しない。
 - regression は scenario ごとに実行する: `static` と `dynamic` を分離。
 - regression では F1 だけでなく `disruption_rate` の悪化量もゲートできる (`--regression-max-disruption-increase`)。
+- 追加 fixture:
+  - `tests/fixtures/static/case_04_cross_file_placeholder` (複数ファイル入力の回帰確認用)
+  - `tests/fixtures/dynamic/meeting_03_fixpoint_cycle` (fixpoint/振動検出挙動の確認用)
+- dynamic の stream timeout 時は、ハーネスが対象 stream worker と子 `claude -p` を明示的に停止してプロセス残留を防ぐ。
 
 ### ローカルゲート
 

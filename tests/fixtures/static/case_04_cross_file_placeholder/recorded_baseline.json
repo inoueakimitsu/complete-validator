@@ -1,0 +1,41 @@
+{
+  "fixture": "case_04_cross_file_placeholder",
+  "mode": "baseline",
+  "generated_at": 1771740000,
+  "exit_code": 0,
+  "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: helper.py]\nNo violations found.\n\n[Rule: readable_code/02_naming.md | File: main.py]\nNo violations found.\n\n[Rule: readable_code/03_comments.md | File: helper.py]\nNo violations found.\n\n[Rule: readable_code/03_comments.md | File: main.py]\nNo violations found.\n",
+  "stderr": "",
+  "rule_results": [
+    {
+      "rule": "readable_code/02_naming.md",
+      "status": "allow",
+      "file": "helper.py",
+      "message": "[Rule: readable_code/02_naming.md | File: helper.py]"
+    },
+    {
+      "rule": "readable_code/02_naming.md",
+      "status": "allow",
+      "file": "main.py",
+      "message": "[Rule: readable_code/02_naming.md | File: main.py]"
+    },
+    {
+      "rule": "readable_code/03_comments.md",
+      "status": "allow",
+      "file": "helper.py",
+      "message": "[Rule: readable_code/03_comments.md | File: helper.py]"
+    },
+    {
+      "rule": "readable_code/03_comments.md",
+      "status": "allow",
+      "file": "main.py",
+      "message": "[Rule: readable_code/03_comments.md | File: main.py]"
+    }
+  ],
+  "raw": {
+    "exit_code": 0,
+    "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: helper.py]\nNo violations found.\n\n[Rule: readable_code/02_naming.md | File: main.py]\nNo violations found.\n\n[Rule: readable_code/03_comments.md | File: helper.py]\nNo violations found.\n\n[Rule: readable_code/03_comments.md | File: main.py]\nNo violations found.\n",
+    "stderr": "",
+    "config_path": "tests/configs/baseline.json"
+  }
+}
+

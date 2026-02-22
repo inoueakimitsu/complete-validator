@@ -1,0 +1,31 @@
+{
+  "description": "fixpoint loop と振動検出の確認用 (同一 violation が再出現するケース)",
+  "target_file": "meeting.transcript.md",
+  "interval_seconds": 5,
+  "steps": [
+    {
+      "step": 1,
+      "time_offset": 0,
+      "append": "## 議題\n山田: リリース手順の確認だけ行います。\n"
+    },
+    {
+      "step": 2,
+      "time_offset": 5,
+      "append": "## 進捗\n佐藤: テストは継続中です。\n"
+    }
+  ],
+  "annotations": [
+    {
+      "rule": "meeting_rules/security_discussion.md",
+      "file": "meeting.transcript.md",
+      "expected_by_step": {
+        "1": "unsatisfied",
+        "2": "unsatisfied"
+      },
+      "expected": "unsatisfied",
+      "lock_on_satisfy": true,
+      "description": "security discussion が出ないため unsatisfied が維持される"
+    }
+  ]
+}
+

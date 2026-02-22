@@ -267,7 +267,47 @@ def _wait_stream_complete(
             if data.get("status") == "completed":
                 return status_path
         time.sleep(0.2)
+    _terminate_stream_worker(stream_id)
     raise TimeoutError(f"stream {stream_id} did not finish in {timeout_seconds}s")
+
+
+def _terminate_stream_worker(stream_id: str) -> None:
+    pattern = f"--stream-worker --stream-id {stream_id}"
+    find_proc = subprocess.run(
+        ["pgrep", "-f", "--", pattern],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if find_proc.returncode != 0:
+        return
+    for line in find_proc.stdout.splitlines():
+        pid = line.strip()
+        if not pid.isdigit():
+            continue
+        child_proc = subprocess.run(
+            ["pgrep", "-P", pid],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if child_proc.returncode == 0:
+            for child in child_proc.stdout.splitlines():
+                child_pid = child.strip()
+                if not child_pid.isdigit():
+                    continue
+                subprocess.run(
+                    ["kill", child_pid],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+        subprocess.run(
+            ["kill", pid],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def _run_stream_once(
