@@ -1295,6 +1295,7 @@ def load_rules_from_dir(rules_dir: Path) -> tuple[RuleList, list[str]]:
         rule_options = {
             "cross_file": bool(frontmatter.get("cross_file", False)),
             "dependency_scope": str(frontmatter.get("dependency_scope", "")).strip().lower(),
+            "severity": str(frontmatter.get("severity", "")).strip().lower(),
         }
 
         # ディレクトリ相対パスをルール名として使用します (例: readable_code/02_naming.md)。
@@ -2078,6 +2079,32 @@ def _watch_priority_from_diff(diff_chunks: dict[str, str]) -> int:
     return WATCH_PRIORITY_NORMAL
 
 
+def _severity_to_watch_priority(severity: str) -> int:
+    normalized = (severity or "").strip().lower()
+    if normalized in {"critical", "high"}:
+        return WATCH_PRIORITY_HIGH
+    if normalized in {"medium"}:
+        return WATCH_PRIORITY_MEDIUM
+    return WATCH_PRIORITY_NORMAL
+
+
+def _watch_priority_from_rule_severity(target_files: list[str], rules: RuleList) -> int:
+    if not target_files or not rules:
+        return WATCH_PRIORITY_NORMAL
+    best = WATCH_PRIORITY_NORMAL
+    for _name, patterns, _body, rule_options in rules:
+        severity = str(rule_options.get("severity", "")).strip().lower()
+        severity_priority = _severity_to_watch_priority(severity)
+        if severity_priority >= best:
+            continue
+        matched = files_matching_patterns(patterns, target_files)
+        if matched:
+            best = severity_priority
+            if best == WATCH_PRIORITY_HIGH:
+                return best
+    return best
+
+
 def build_watch_check_command(args: argparse.Namespace) -> list[str]:
     cmd = [sys.executable, __file__]
     if args.staged:
@@ -2187,6 +2214,9 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     reinsert_delay = max(0.1, float(args.watch_reinsert_delay_seconds))
 
     command = build_watch_check_command(args)
+    project_dirs = find_project_rules_dirs()
+    builtin_dir = args.plugin_dir / "rules" if args.plugin_dir else None
+    rules, _warnings = merge_rules(builtin_dir, project_dirs)
     last_applied_signature: str | None = None
     pending_queue: list[dict] = []
     delayed_queue: list[dict] = []
@@ -2195,7 +2225,10 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     while True:
         target_files, diff_chunks = resolve_target_files(args.staged, full_scan=False)
         current_signature = _watch_signature(target_files, diff_chunks)
-        current_priority = _watch_priority_from_diff(diff_chunks)
+        current_priority = min(
+            _watch_priority_from_diff(diff_chunks),
+            _watch_priority_from_rule_severity(target_files, rules),
+        )
         now = time.monotonic()
         _watch_restore_delayed_signatures(pending_queue, delayed_queue, now, queue_max)
         _watch_enqueue_signature(

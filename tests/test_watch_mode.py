@@ -224,3 +224,34 @@ def test_watch_restore_delayed_prefers_high_priority_when_capacity_limited():
 
     assert [item["signature"] for item in pending] == ["high-a"]
     assert [item["signature"] for item in delayed] == ["normal-a"]
+
+
+def test_watch_priority_from_rule_severity_uses_matching_rule_level():
+    check_style = _load_check_style_module()
+    rules = [
+        ("rule_low.md", ["*.py"], "body", {"severity": "low"}),
+        ("rule_high.md", ["security_*.md"], "body", {"severity": "high"}),
+    ]
+
+    p1 = check_style._watch_priority_from_rule_severity(["main.py"], rules)
+    p2 = check_style._watch_priority_from_rule_severity(["security_notes.md"], rules)
+    p3 = check_style._watch_priority_from_rule_severity(["README.txt"], rules)
+
+    assert p1 == check_style.WATCH_PRIORITY_NORMAL
+    assert p2 == check_style.WATCH_PRIORITY_HIGH
+    assert p3 == check_style.WATCH_PRIORITY_NORMAL
+
+
+def test_watch_priority_combines_rule_severity_and_diff_keywords():
+    check_style = _load_check_style_module()
+    rules = [
+        ("rule_medium.md", ["*.md"], "body", {"severity": "medium"}),
+    ]
+    target_files = ["notes.md"]
+    diff_chunks = {"notes.md": "minor edit"}
+
+    combined = min(
+        check_style._watch_priority_from_diff(diff_chunks),
+        check_style._watch_priority_from_rule_severity(target_files, rules),
+    )
+    assert combined == check_style.WATCH_PRIORITY_MEDIUM
