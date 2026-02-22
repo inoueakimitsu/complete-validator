@@ -78,6 +78,17 @@ DEFAULT_WATCH_INTERVAL_SECONDS = 1.0
 DEFAULT_WATCH_DEBOUNCE_SECONDS = 0.5
 DEFAULT_WATCH_QUEUE_MAX = 8
 DEFAULT_WATCH_REINSERT_DELAY_SECONDS = 2.0
+WATCH_HIGH_PRIORITY_KEYWORDS = (
+    "security",
+    "auth",
+    "permission",
+    "password",
+    "token",
+    "secret",
+    "csrf",
+    "xss",
+    "sql injection",
+)
 
 
 def _default_rule_config() -> dict:
@@ -2043,6 +2054,16 @@ def _watch_signature(target_files: list[str], diff_chunks: dict[str, str]) -> st
     return json.dumps({"files": files, "diff_hash": diff_hash}, ensure_ascii=False, sort_keys=True)
 
 
+def _watch_priority_from_diff(diff_chunks: dict[str, str]) -> int:
+    if not diff_chunks:
+        return 1
+    text = "\n".join(diff_chunks.values()).lower()
+    for keyword in WATCH_HIGH_PRIORITY_KEYWORDS:
+        if keyword in text:
+            return 0
+    return 1
+
+
 def build_watch_check_command(args: argparse.Namespace) -> list[str]:
     cmd = [sys.executable, __file__]
     if args.staged:
@@ -2072,9 +2093,17 @@ def _watch_restore_delayed_signatures(
             {
                 "signature": item.get("signature", ""),
                 "enqueued_at": now,
+                "priority": int(item.get("priority", 1)),
             }
         )
     delayed_queue[:] = remaining
+
+
+def _watch_select_drop_index(pending_queue: list[dict]) -> int:
+    for idx, item in enumerate(pending_queue):
+        if int(item.get("priority", 1)) > 0:
+            return idx
+    return 0
 
 
 def _watch_enqueue_signature(
@@ -2085,25 +2114,38 @@ def _watch_enqueue_signature(
     queue_max: int,
     reinsert_delay: float,
     last_applied_signature: str | None,
+    priority: int = 1,
 ) -> None:
     if signature == "EMPTY":
         return
     if signature == last_applied_signature:
         return
-    if any(item.get("signature") == signature for item in pending_queue):
-        return
-    if any(item.get("signature") == signature for item in delayed_queue):
-        return
+    for item in pending_queue:
+        if item.get("signature") == signature:
+            item["priority"] = min(int(item.get("priority", 1)), int(priority))
+            return
+    for item in delayed_queue:
+        if item.get("signature") == signature:
+            item["priority"] = min(int(item.get("priority", 1)), int(priority))
+            return
 
     if len(pending_queue) >= queue_max:
-        dropped = pending_queue.pop(0)
+        drop_idx = _watch_select_drop_index(pending_queue)
+        dropped = pending_queue.pop(drop_idx)
         delayed_queue.append(
             {
                 "signature": dropped.get("signature", ""),
                 "eligible_at": now + reinsert_delay,
+                "priority": int(dropped.get("priority", 1)),
             }
         )
-    pending_queue.append({"signature": signature, "enqueued_at": now})
+    pending_queue.append(
+        {
+            "signature": signature,
+            "enqueued_at": now,
+            "priority": int(priority),
+        }
+    )
 
 
 def run_watch_mode(args: argparse.Namespace) -> None:
@@ -2124,6 +2166,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     while True:
         target_files, diff_chunks = resolve_target_files(args.staged, full_scan=False)
         current_signature = _watch_signature(target_files, diff_chunks)
+        current_priority = _watch_priority_from_diff(diff_chunks)
         now = time.monotonic()
         _watch_restore_delayed_signatures(pending_queue, delayed_queue, now, queue_max)
         _watch_enqueue_signature(
@@ -2134,6 +2177,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
             queue_max=queue_max,
             reinsert_delay=reinsert_delay,
             last_applied_signature=last_applied_signature,
+            priority=current_priority,
         )
 
         ready = (

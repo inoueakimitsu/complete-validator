@@ -154,3 +154,52 @@ def test_watch_queue_overflow_moves_oldest_to_delayed_and_restores():
     )
     assert [item["signature"] for item in pending] == ["sig-2", "sig-1"]
     assert delayed == []
+
+
+def test_watch_priority_from_diff_marks_security_related_changes_high():
+    check_style = _load_check_style_module()
+    normal = check_style._watch_priority_from_diff({"a.py": "print('hello')"})
+    high = check_style._watch_priority_from_diff({"a.py": "set user password and auth token"})
+
+    assert normal == 1
+    assert high == 0
+
+
+def test_watch_queue_overflow_keeps_high_priority_entries():
+    check_style = _load_check_style_module()
+    pending = []
+    delayed = []
+
+    check_style._watch_enqueue_signature(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        signature="high-1",
+        now=1.0,
+        queue_max=2,
+        reinsert_delay=2.0,
+        last_applied_signature=None,
+        priority=0,
+    )
+    check_style._watch_enqueue_signature(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        signature="normal-1",
+        now=1.1,
+        queue_max=2,
+        reinsert_delay=2.0,
+        last_applied_signature=None,
+        priority=1,
+    )
+    check_style._watch_enqueue_signature(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        signature="high-2",
+        now=1.2,
+        queue_max=2,
+        reinsert_delay=2.0,
+        last_applied_signature=None,
+        priority=0,
+    )
+
+    assert [item["signature"] for item in pending] == ["high-1", "high-2"]
+    assert [item["signature"] for item in delayed] == ["normal-1"]
