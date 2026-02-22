@@ -10,6 +10,8 @@ def print_summary(label: str, metrics: dict[str, float], timing: dict[str, float
     print(f"Precision: {metrics['precision']:.4f}")
     print(f"Recall:    {metrics['recall']:.4f}")
     print(f"F1:        {metrics['f1']:.4f}")
+    if "disruption_rate" in metrics:
+        print(f"Disruption:{metrics['disruption_rate']:.4f}")
     print(f"TP: {metrics['tp']} FP: {metrics['fp']} FN: {metrics['fn']} TN: {metrics['tn']}")
     if timing:
         if timing.get("mode"):
@@ -26,7 +28,10 @@ def print_summary(label: str, metrics: dict[str, float], timing: dict[str, float
 
 def print_comparison(name_a: str, metrics_a: dict[str, float], name_b: str, metrics_b: dict[str, float]) -> None:
     print(f"\n=== {name_a} vs {name_b} ===")
-    for key in ["precision", "recall", "f1"]:
+    keys = ["precision", "recall", "f1"]
+    if "disruption_rate" in metrics_a and "disruption_rate" in metrics_b:
+        keys.append("disruption_rate")
+    for key in keys:
         av = metrics_a[key]
         bv = metrics_b[key]
         sign = "+" if bv >= av else "-"

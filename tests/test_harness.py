@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         help="maximum allowed F1 drop in regression before failing",
     )
     parser.add_argument(
+        "--regression-max-disruption-increase",
+        type=float,
+        default=0.10,
+        help="maximum allowed disruption_rate increase in regression before failing",
+    )
+    parser.add_argument(
         "--regression-scenario",
         choices=["static", "dynamic"],
         default="static",
@@ -575,7 +581,12 @@ def run_dynamic(
     return agg, details
 
 
-def run_regression(root: Path, max_drop: float, scenario: str) -> None:
+def run_regression(
+    root: Path,
+    max_drop: float,
+    scenario: str,
+    max_disruption_increase: float,
+) -> None:
     results_root = root / "tests" / "results"
     if not results_root.exists():
         raise RuntimeError("results directory not found")
@@ -610,7 +621,12 @@ def run_regression(root: Path, max_drop: float, scenario: str) -> None:
     prev_f1 = float(prev_metrics.get("f1", 0.0))
     latest_f1 = float(latest_metrics.get("f1", 0.0))
     f1_drop = prev_f1 - latest_f1
-    ok = f1_drop <= max_drop
+    prev_disruption = float(prev_metrics.get("disruption_rate", 0.0))
+    latest_disruption = float(latest_metrics.get("disruption_rate", 0.0))
+    disruption_increase = latest_disruption - prev_disruption
+    ok_f1 = f1_drop <= max_drop
+    ok_disruption = disruption_increase <= max_disruption_increase
+    ok = ok_f1 and ok_disruption
     emit_summary(
         {
             "scenario": "regression",
@@ -621,14 +637,25 @@ def run_regression(root: Path, max_drop: float, scenario: str) -> None:
             "latest_dir": dirs[-1].name,
             "f1_drop": f1_drop,
             "max_allowed_drop": max_drop,
+            "disruption_increase": disruption_increase,
+            "max_allowed_disruption_increase": max_disruption_increase,
+            "ok_f1": ok_f1,
+            "ok_disruption": ok_disruption,
             "ok": ok,
         },
         str(results_root / f"regression_{scenario}.json"),
     )
     if not ok:
-        raise RuntimeError(
-            f"regression failed: F1 dropped by {f1_drop:.4f} (> {max_drop:.4f})"
-        )
+        reasons: list[str] = []
+        if not ok_f1:
+            reasons.append(
+                f"F1 dropped by {f1_drop:.4f} (> {max_drop:.4f})"
+            )
+        if not ok_disruption:
+            reasons.append(
+                f"disruption increased by {disruption_increase:.4f} (> {max_disruption_increase:.4f})"
+            )
+        raise RuntimeError(f"regression failed: {'; '.join(reasons)}")
 
 
 def print_and_persist(
@@ -671,7 +698,12 @@ def main() -> None:
 
     config_paths = resolve_default_configs(args, root)
     if args.scenario == "regression":
-        run_regression(root, args.regression_max_drop, args.regression_scenario)
+        run_regression(
+            root,
+            args.regression_max_drop,
+            args.regression_scenario,
+            args.regression_max_disruption_increase,
+        )
         return
 
     if args.scenario == "dynamic":

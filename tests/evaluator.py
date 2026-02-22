@@ -96,10 +96,14 @@ def aggregate_metrics(metrics: list[EvalMetrics]) -> dict[str, float]:
         agg.false_negatives += m.false_negatives
         agg.true_negatives += m.true_negatives
 
+    disruption_denom = agg.false_positives + agg.true_negatives
+    disruption_rate = agg.false_positives / disruption_denom if disruption_denom else 0.0
+
     return {
         "precision": agg.precision,
         "recall": agg.recall,
         "f1": agg.f1,
+        "disruption_rate": disruption_rate,
         "total_violation_gold": agg.true_positives + agg.false_negatives,
         "tp": agg.true_positives,
         "fp": agg.false_positives,

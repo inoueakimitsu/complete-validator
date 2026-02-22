@@ -443,6 +443,7 @@ python3 tests/test_harness.py --scenario regression
 # regression 失敗しきい値を変更 (F1 drop)
 python3 tests/test_harness.py --scenario regression --regression-max-drop 0.02
 python3 tests/test_harness.py --scenario regression --regression-scenario dynamic --regression-max-drop 0.02
+python3 tests/test_harness.py --scenario regression --regression-scenario dynamic --regression-max-drop 0.02 --regression-max-disruption-increase 0.05
 
 # 録画の更新と検証を一括実行
 bash tests/update_recordings.sh
@@ -463,6 +464,7 @@ bash tests/update_recordings.sh
 - `lock_on_satisfy` 付きルールは step 間で satisfied 状態を保持して評価する。
 - baseline/optimized は別 config を必ず使い分ける。比較時に同一 config を再利用しない。
 - regression は scenario ごとに実行する: `static` と `dynamic` を分離。
+- regression では F1 だけでなく `disruption_rate` の悪化量もゲートできる (`--regression-max-disruption-increase`)。
 
 ### ローカルゲート
 
@@ -836,11 +838,13 @@ chmod +x .git/hooks/pre-push
   - `llm_calls`、`default_model`、`max_workers`、`cache_hit` 率
   - baseline/optimized 比較時のモデル選択差 (`sonnet` vs `haiku`)
 - `C_disruption` の代理:
-  - dynamic での `false_positives`、`expected_by_step` に対する過剰警告率
+  - `tests/evaluator.py` の `disruption_rate = fp / (fp + tn)`
+  - regression での `disruption_rate` 増分ゲート (`--regression-max-disruption-increase`)
 
 設計上の判定原則:
 
 - 最適化変更は、`F1` を劣化させずに (`regression-max-drop` を超えずに) `wall_time` と `llm_calls` を下げる方向のみ採用する。
+- dynamic では `disruption_rate` の悪化も制限する (`regression-max-disruption-increase` を超えない)。
 - いずれかを改善しても見逃しが増える変更は採用しない。
 
 ### 現在の実装スコープ
