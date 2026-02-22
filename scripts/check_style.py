@@ -78,6 +78,9 @@ DEFAULT_WATCH_INTERVAL_SECONDS = 1.0
 DEFAULT_WATCH_DEBOUNCE_SECONDS = 0.5
 DEFAULT_WATCH_QUEUE_MAX = 8
 DEFAULT_WATCH_REINSERT_DELAY_SECONDS = 2.0
+WATCH_PRIORITY_HIGH = 0
+WATCH_PRIORITY_MEDIUM = 1
+WATCH_PRIORITY_NORMAL = 2
 WATCH_HIGH_PRIORITY_KEYWORDS = (
     "security",
     "auth",
@@ -88,6 +91,14 @@ WATCH_HIGH_PRIORITY_KEYWORDS = (
     "csrf",
     "xss",
     "sql injection",
+)
+WATCH_MEDIUM_PRIORITY_KEYWORDS = (
+    "privacy",
+    "compliance",
+    "encrypt",
+    "decrypt",
+    "audit",
+    "rate limit",
 )
 
 
@@ -2056,12 +2067,15 @@ def _watch_signature(target_files: list[str], diff_chunks: dict[str, str]) -> st
 
 def _watch_priority_from_diff(diff_chunks: dict[str, str]) -> int:
     if not diff_chunks:
-        return 1
+        return WATCH_PRIORITY_NORMAL
     text = "\n".join(diff_chunks.values()).lower()
     for keyword in WATCH_HIGH_PRIORITY_KEYWORDS:
         if keyword in text:
-            return 0
-    return 1
+            return WATCH_PRIORITY_HIGH
+    for keyword in WATCH_MEDIUM_PRIORITY_KEYWORDS:
+        if keyword in text:
+            return WATCH_PRIORITY_MEDIUM
+    return WATCH_PRIORITY_NORMAL
 
 
 def build_watch_check_command(args: argparse.Namespace) -> list[str]:
@@ -2081,6 +2095,12 @@ def _watch_restore_delayed_signatures(
     now: float,
     queue_max: int,
 ) -> None:
+    delayed_queue.sort(
+        key=lambda item: (
+            int(item.get("priority", WATCH_PRIORITY_NORMAL)),
+            float(item.get("eligible_at", 0.0)),
+        )
+    )
     remaining: list[dict] = []
     for item in delayed_queue:
         if len(pending_queue) >= queue_max:
@@ -2093,17 +2113,20 @@ def _watch_restore_delayed_signatures(
             {
                 "signature": item.get("signature", ""),
                 "enqueued_at": now,
-                "priority": int(item.get("priority", 1)),
+                "priority": int(item.get("priority", WATCH_PRIORITY_NORMAL)),
             }
         )
     delayed_queue[:] = remaining
 
 
 def _watch_select_drop_index(pending_queue: list[dict]) -> int:
+    if not pending_queue:
+        return 0
+    worst_priority = max(int(item.get("priority", WATCH_PRIORITY_NORMAL)) for item in pending_queue)
     for idx, item in enumerate(pending_queue):
-        if int(item.get("priority", 1)) > 0:
+        if int(item.get("priority", WATCH_PRIORITY_NORMAL)) == worst_priority:
             return idx
-    return 0
+    return len(pending_queue) - 1
 
 
 def _watch_enqueue_signature(
@@ -2114,7 +2137,7 @@ def _watch_enqueue_signature(
     queue_max: int,
     reinsert_delay: float,
     last_applied_signature: str | None,
-    priority: int = 1,
+    priority: int = WATCH_PRIORITY_NORMAL,
 ) -> None:
     if signature == "EMPTY":
         return
@@ -2122,11 +2145,17 @@ def _watch_enqueue_signature(
         return
     for item in pending_queue:
         if item.get("signature") == signature:
-            item["priority"] = min(int(item.get("priority", 1)), int(priority))
+            item["priority"] = min(
+                int(item.get("priority", WATCH_PRIORITY_NORMAL)),
+                int(priority),
+            )
             return
     for item in delayed_queue:
         if item.get("signature") == signature:
-            item["priority"] = min(int(item.get("priority", 1)), int(priority))
+            item["priority"] = min(
+                int(item.get("priority", WATCH_PRIORITY_NORMAL)),
+                int(priority),
+            )
             return
 
     if len(pending_queue) >= queue_max:
@@ -2136,7 +2165,7 @@ def _watch_enqueue_signature(
             {
                 "signature": dropped.get("signature", ""),
                 "eligible_at": now + reinsert_delay,
-                "priority": int(dropped.get("priority", 1)),
+                "priority": int(dropped.get("priority", WATCH_PRIORITY_NORMAL)),
             }
         )
     pending_queue.append(

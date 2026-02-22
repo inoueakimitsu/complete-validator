@@ -159,10 +159,12 @@ def test_watch_queue_overflow_moves_oldest_to_delayed_and_restores():
 def test_watch_priority_from_diff_marks_security_related_changes_high():
     check_style = _load_check_style_module()
     normal = check_style._watch_priority_from_diff({"a.py": "print('hello')"})
+    medium = check_style._watch_priority_from_diff({"a.py": "add audit logging for compliance"})
     high = check_style._watch_priority_from_diff({"a.py": "set user password and auth token"})
 
-    assert normal == 1
-    assert high == 0
+    assert normal == check_style.WATCH_PRIORITY_NORMAL
+    assert medium == check_style.WATCH_PRIORITY_MEDIUM
+    assert high == check_style.WATCH_PRIORITY_HIGH
 
 
 def test_watch_queue_overflow_keeps_high_priority_entries():
@@ -203,3 +205,22 @@ def test_watch_queue_overflow_keeps_high_priority_entries():
 
     assert [item["signature"] for item in pending] == ["high-1", "high-2"]
     assert [item["signature"] for item in delayed] == ["normal-1"]
+
+
+def test_watch_restore_delayed_prefers_high_priority_when_capacity_limited():
+    check_style = _load_check_style_module()
+    pending = []
+    delayed = [
+        {"signature": "normal-a", "eligible_at": 1.0, "priority": check_style.WATCH_PRIORITY_NORMAL},
+        {"signature": "high-a", "eligible_at": 1.0, "priority": check_style.WATCH_PRIORITY_HIGH},
+    ]
+
+    check_style._watch_restore_delayed_signatures(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        now=2.0,
+        queue_max=1,
+    )
+
+    assert [item["signature"] for item in pending] == ["high-a"]
+    assert [item["signature"] for item in delayed] == ["normal-a"]
