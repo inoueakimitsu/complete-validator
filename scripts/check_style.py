@@ -76,6 +76,8 @@ DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_RULE_CONFIG_VERSION = 1
 DEFAULT_WATCH_INTERVAL_SECONDS = 1.0
 DEFAULT_WATCH_DEBOUNCE_SECONDS = 0.5
+DEFAULT_WATCH_QUEUE_MAX = 8
+DEFAULT_WATCH_REINSERT_DELAY_SECONDS = 2.0
 
 
 def _default_rule_config() -> dict:
@@ -2006,6 +2008,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="--watch 時の最大再実行回数。0 は無制限。",
     )
+    parser.add_argument(
+        "--watch-queue-max",
+        type=int,
+        default=DEFAULT_WATCH_QUEUE_MAX,
+        help="--watch 時の保留シグネチャ キュー上限。",
+    )
+    parser.add_argument(
+        "--watch-reinsert-delay-seconds",
+        type=float,
+        default=DEFAULT_WATCH_REINSERT_DELAY_SECONDS,
+        help="キューあふれ時に退避したシグネチャを再挿入するまでの遅延 (秒)。",
+    )
     return parser.parse_args()
 
 
@@ -2040,39 +2054,96 @@ def build_watch_check_command(args: argparse.Namespace) -> list[str]:
     return cmd
 
 
+def _watch_restore_delayed_signatures(
+    pending_queue: list[dict],
+    delayed_queue: list[dict],
+    now: float,
+    queue_max: int,
+) -> None:
+    remaining: list[dict] = []
+    for item in delayed_queue:
+        if len(pending_queue) >= queue_max:
+            remaining.append(item)
+            continue
+        if float(item.get("eligible_at", 0.0)) > now:
+            remaining.append(item)
+            continue
+        pending_queue.append(
+            {
+                "signature": item.get("signature", ""),
+                "enqueued_at": now,
+            }
+        )
+    delayed_queue[:] = remaining
+
+
+def _watch_enqueue_signature(
+    pending_queue: list[dict],
+    delayed_queue: list[dict],
+    signature: str,
+    now: float,
+    queue_max: int,
+    reinsert_delay: float,
+    last_applied_signature: str | None,
+) -> None:
+    if signature == "EMPTY":
+        return
+    if signature == last_applied_signature:
+        return
+    if any(item.get("signature") == signature for item in pending_queue):
+        return
+    if any(item.get("signature") == signature for item in delayed_queue):
+        return
+
+    if len(pending_queue) >= queue_max:
+        dropped = pending_queue.pop(0)
+        delayed_queue.append(
+            {
+                "signature": dropped.get("signature", ""),
+                "eligible_at": now + reinsert_delay,
+            }
+        )
+    pending_queue.append({"signature": signature, "enqueued_at": now})
+
+
 def run_watch_mode(args: argparse.Namespace) -> None:
     if args.full_scan:
         raise SystemExit("--watch does not support --full-scan because full-scan has no diff signal")
     interval = max(0.1, float(args.watch_interval_seconds))
     debounce = max(0.0, float(args.watch_debounce_seconds))
     max_runs = int(args.watch_max_runs) if int(args.watch_max_runs) > 0 else 0
+    queue_max = max(1, int(args.watch_queue_max))
+    reinsert_delay = max(0.1, float(args.watch_reinsert_delay_seconds))
 
     command = build_watch_check_command(args)
     last_applied_signature: str | None = None
-    pending_signature: str | None = None
-    pending_since: float | None = None
+    pending_queue: list[dict] = []
+    delayed_queue: list[dict] = []
     runs = 0
 
     while True:
         target_files, diff_chunks = resolve_target_files(args.staged, full_scan=False)
         current_signature = _watch_signature(target_files, diff_chunks)
         now = time.monotonic()
-
-        if current_signature != last_applied_signature and current_signature != pending_signature:
-            pending_signature = current_signature
-            pending_since = now
+        _watch_restore_delayed_signatures(pending_queue, delayed_queue, now, queue_max)
+        _watch_enqueue_signature(
+            pending_queue=pending_queue,
+            delayed_queue=delayed_queue,
+            signature=current_signature,
+            now=now,
+            queue_max=queue_max,
+            reinsert_delay=reinsert_delay,
+            last_applied_signature=last_applied_signature,
+        )
 
         ready = (
-            pending_signature is not None
-            and pending_signature != "EMPTY"
-            and pending_since is not None
-            and (now - pending_since) >= debounce
+            len(pending_queue) > 0
+            and (now - float(pending_queue[0].get("enqueued_at", now))) >= debounce
         )
         if ready:
             subprocess.run(command, check=False)
-            last_applied_signature = pending_signature
-            pending_signature = None
-            pending_since = None
+            last_applied_signature = str(pending_queue[0].get("signature", ""))
+            pending_queue.pop(0)
             runs += 1
             if max_runs > 0 and runs >= max_runs:
                 return

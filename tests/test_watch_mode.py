@@ -58,6 +58,8 @@ def test_run_watch_mode_triggers_once_and_stops(monkeypatch):
         watch_interval_seconds=0.1,
         watch_debounce_seconds=0.0,
         watch_max_runs=1,
+        watch_queue_max=8,
+        watch_reinsert_delay_seconds=2.0,
         stream=False,
         stream_worker=False,
     )
@@ -97,9 +99,58 @@ def test_run_watch_mode_rejects_full_scan():
         watch_interval_seconds=0.1,
         watch_debounce_seconds=0.0,
         watch_max_runs=1,
+        watch_queue_max=8,
+        watch_reinsert_delay_seconds=2.0,
         stream=False,
         stream_worker=False,
     )
 
     with pytest.raises(SystemExit):
         check_style.run_watch_mode(args)
+
+
+def test_watch_queue_overflow_moves_oldest_to_delayed_and_restores():
+    check_style = _load_check_style_module()
+    pending = []
+    delayed = []
+
+    check_style._watch_enqueue_signature(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        signature="sig-1",
+        now=1.0,
+        queue_max=1,
+        reinsert_delay=2.0,
+        last_applied_signature=None,
+    )
+    check_style._watch_enqueue_signature(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        signature="sig-2",
+        now=2.0,
+        queue_max=1,
+        reinsert_delay=2.0,
+        last_applied_signature=None,
+    )
+
+    assert [item["signature"] for item in pending] == ["sig-2"]
+    assert [item["signature"] for item in delayed] == ["sig-1"]
+    assert delayed[0]["eligible_at"] == 4.0
+
+    check_style._watch_restore_delayed_signatures(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        now=3.9,
+        queue_max=2,
+    )
+    assert [item["signature"] for item in pending] == ["sig-2"]
+    assert [item["signature"] for item in delayed] == ["sig-1"]
+
+    check_style._watch_restore_delayed_signatures(
+        pending_queue=pending,
+        delayed_queue=delayed,
+        now=4.1,
+        queue_max=2,
+    )
+    assert [item["signature"] for item in pending] == ["sig-2", "sig-1"]
+    assert delayed == []

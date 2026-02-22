@@ -438,6 +438,8 @@ python3 scripts/check_style.py --list-violations <stream-id> --plugin-dir /path/
 # watch モード (変更検知で自動再チェック)
 python3 scripts/check_style.py --watch --plugin-dir /path/to/complete-validator
 python3 scripts/check_style.py --watch --staged --watch-interval-seconds 1.0 --watch-debounce-seconds 0.5
+# バックプレッシャー設定 (キュー上限 + 遅延再挿入)
+python3 scripts/check_style.py --watch --watch-queue-max 8 --watch-reinsert-delay-seconds 2.0
 # 単発検証用: 最大 1 回だけ再実行して終了
 python3 scripts/check_style.py --watch --watch-max-runs 1
 ```
@@ -1254,15 +1256,17 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
   - ロック根拠部分に変更が重なった場合はアンロックする。
   - ロック/アンロックの振動を避けるため、再ロックには連続 satisfied などのヒステリシス条件を置く。
 
-### 10. watch モードとバックプレッシャー (拡張方針)
+### 10. watch モードとバックプレッシャー
 
 - 現状:
   - `--watch` の最小実装を導入済み。
   - 差分シグネチャ変化をポーリング検知し、デバウンス後に自動再チェックを実行できる。
   - `--watch-max-runs` で実行回数上限を指定できる (0 は無制限)。
-- 方針:
-  - 連続変更時のキュー上限、低優先度の遅延再挿入は未実装。6-2 で対応する。
-  - 高 severity はドロップせず優先維持する。
+- 実装済み:
+  - 連続変更時のキュー上限 (`--watch-queue-max`)。
+  - あふれたシグネチャの遅延再挿入 (`--watch-reinsert-delay-seconds`)。
+- 未実装:
+  - 高 severity をドロップせず優先維持する優先度付きバックプレッシャー。
 
 ### 11. セキュリティ・データ保持方針
 
@@ -1290,10 +1294,11 @@ queue ファイル名の `priority` は任意値ではなく、severity から�
   - decision 単位の設定変更監査ログ (`append_rule_config_decision`)
   - cross-file 再チェック拡大 (`cross_file: true` + `dependency_scope: "python_imports"`)
   - watch モード最小実装 (`--watch`)
+  - watch バックプレッシャー最小実装 (キュー上限 + 遅延再挿入)
   - dynamic ハーネスの反復上限付き fixpoint ループ (`--max-fixpoint-iterations`)
   - 振動検出 (`state signature`) と `manual_review_required` 出力
 - 方針 (未実装):
-  - watch モードのバックプレッシャー (キュー上限、遅延再挿入)
+  - watch モードの優先度付きバックプレッシャー (severity 保持)
   - lock_on_satisfy のアンロック・ヒステリシス
 
 ### 14. 誤解しやすいポイント (実装前に必読)
