@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run live checks and write recorded_<config>.json for static fixtures",
     )
+    parser.add_argument(
+        "--sanitize-recordings",
+        action="store_true",
+        help="sanitize recorded payloads by removing raw stdout/stderr and detailed messages",
+    )
     parser.add_argument("--show-results", dest="show_results", help="show results path")
     parser.add_argument(
         "--wait-seconds",
@@ -100,12 +105,35 @@ def _to_check_result(fixture_name: str, entries: list[dict], stream_id: str) -> 
     )
 
 
+def _sanitize_recorded_payload(payload: dict) -> dict:
+    sanitized = dict(payload)
+    sanitized["stdout"] = "[SANITIZED]"
+    sanitized["stderr"] = "[SANITIZED]"
+
+    sanitized_rules: list[dict] = []
+    for item in payload.get("rule_results", []):
+        if not isinstance(item, dict):
+            continue
+        sanitized_rules.append(
+            {
+                "rule": item.get("rule", ""),
+                "status": item.get("status", "allow"),
+                "file": item.get("file"),
+                "message": "[SANITIZED]",
+            }
+        )
+    sanitized["rule_results"] = sanitized_rules
+    sanitized["raw"] = {"sanitized": True}
+    return sanitized
+
+
 def run_static(
     config_path: Path,
     fixture_filter: list[str] | None,
     runner_cfg: RunnerConfig,
     recorded: bool,
     record: bool = False,
+    sanitize_recordings: bool = False,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     fm = FixtureManager(runner_cfg.root / "tests" / "fixtures")
     fixtures = fm.list_static_fixtures(fixture_filter)
@@ -170,6 +198,8 @@ def run_static(
                 "rule_results": run_result.rule_results,
                 "raw": run_result.raw,
             }
+            if sanitize_recordings:
+                recorded_payload = _sanitize_recorded_payload(recorded_payload)
             recorded_path.write_text(
                 json.dumps(recorded_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -614,6 +644,7 @@ def main() -> None:
             runner_cfg,
             args.recorded,
             record=args.record,
+            sanitize_recordings=args.sanitize_recordings,
         )
         timing = details.get("timing", {"wall_time": 0.0, "llm_calls": 0})
         print_and_persist(
@@ -643,6 +674,7 @@ def main() -> None:
         baseline_cfg,
         args.recorded,
         record=args.record,
+        sanitize_recordings=args.sanitize_recordings,
     )
     optimized, opt_detail = run_static(
         config_paths[1],
@@ -650,6 +682,7 @@ def main() -> None:
         optimized_cfg,
         args.recorded,
         record=args.record,
+        sanitize_recordings=args.sanitize_recordings,
     )
     print_comparison(config_paths[0].stem, baseline, config_paths[1].stem, optimized)
 
