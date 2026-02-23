@@ -995,6 +995,51 @@ def persist_shadow_comparison(
     emit_summary(payload, str(out_path))
 
 
+def load_runtime_config_for_recommendation(config_path: Path) -> dict:
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def discover_rule_keys_for_recommendation(root: Path) -> list[str]:
+    rules_dir = root / "rules"
+    if not rules_dir.exists():
+        return []
+    keys: list[str] = []
+    for path in sorted(rules_dir.rglob("*.md")):
+        try:
+            relative = path.relative_to(rules_dir).as_posix()
+        except ValueError:
+            continue
+        if relative:
+            keys.append(relative)
+    return keys
+
+
+def build_rule_recommendations(rule_keys: list[str], candidate_runtime_config: dict) -> dict[str, dict]:
+    if not rule_keys:
+        return {}
+    updates: dict[str, object] = {}
+    model = candidate_runtime_config.get("default_model")
+    if isinstance(model, str) and model.strip():
+        updates["model"] = model.strip()
+    context_level = candidate_runtime_config.get("context_level")
+    if isinstance(context_level, str) and context_level.strip():
+        updates["context_level"] = context_level.strip()
+    for key in ("batching", "cache"):
+        value = candidate_runtime_config.get(key)
+        if isinstance(value, bool):
+            updates[key] = value
+
+    if not updates:
+        return {}
+    return {rule_key: dict(updates) for rule_key in rule_keys}
+
+
 def evaluate_shadow_recommendation(
     current_metrics: dict[str, float],
     candidate_metrics: dict[str, float],
@@ -1056,6 +1101,7 @@ def persist_shadow_recommendation(
     candidate_name: str,
     candidate_metrics: dict[str, float],
     candidate_timing: dict[str, float],
+    rule_recommendations: dict[str, dict] | None = None,
     *,
     max_f1_drop: float,
     max_disruption_increase: float,
@@ -1068,6 +1114,9 @@ def persist_shadow_recommendation(
         max_f1_drop=max_f1_drop,
         max_disruption_increase=max_disruption_increase,
     )
+    if isinstance(rule_recommendations, dict) and rule_recommendations:
+        recommendation["rule_recommendations"] = rule_recommendations
+
     payload = {
         "scenario": "shadow_recommendation",
         "base_scenario": scenario,
@@ -1302,6 +1351,10 @@ def main() -> None:
         candidate_metrics=optimized,
         candidate_timing=opt_detail.get("timing", {}),
     )
+    candidate_runtime_config = load_runtime_config_for_recommendation(config_paths[1])
+    rule_keys = discover_rule_keys_for_recommendation(root)
+    rule_recommendations = build_rule_recommendations(rule_keys, candidate_runtime_config)
+
     recommendation = persist_shadow_recommendation(
         root=root,
         scenario=args.scenario,
@@ -1311,6 +1364,7 @@ def main() -> None:
         candidate_name=config_paths[1].stem,
         candidate_metrics=optimized,
         candidate_timing=opt_detail.get("timing", {}),
+        rule_recommendations=rule_recommendations,
         max_f1_drop=args.regression_max_drop,
         max_disruption_increase=args.regression_max_disruption_increase,
     )

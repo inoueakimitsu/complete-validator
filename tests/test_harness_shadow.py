@@ -73,6 +73,21 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
         "resolve_default_configs",
         lambda _args, root: [root / "tests" / "configs" / "baseline.json", root / "tests" / "configs" / "optimized.json"],
     )
+    monkeypatch.setattr(
+        harness,
+        "load_runtime_config_for_recommendation",
+        lambda _config_path: {
+            "default_model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": True,
+        },
+    )
+    monkeypatch.setattr(
+        harness,
+        "discover_rule_keys_for_recommendation",
+        lambda _root: ["readable_code/08_functions.md"],
+    )
 
     def fake_run_static(config_path, fixture_filter, runner_cfg, recorded, record=False, sanitize_recordings=False):
         if config_path.stem == "baseline":
@@ -118,6 +133,14 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
     assert recommendation_calls[0]["scenario"] == "static"
     assert recommendation_calls[0]["current_name"] == "baseline"
     assert recommendation_calls[0]["candidate_name"] == "optimized"
+    assert recommendation_calls[0]["rule_recommendations"] == {
+        "readable_code/08_functions.md": {
+            "model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": True,
+        }
+    }
     assert len(decision_calls) == 1
     assert decision_calls[0]["approve"] is False
 
@@ -156,6 +179,34 @@ def test_evaluate_shadow_recommendation_rejects_when_f1_drop_exceeds_guardrail()
     assert recommendation["guardrail_passed"] is False
     assert recommendation["cost_improved"] is True
     assert any("F1 dropped" in reason for reason in recommendation["reasons"])
+
+
+def test_build_rule_recommendations_uses_candidate_runtime_config():
+    harness = _load_test_harness_module()
+    recommendations = harness.build_rule_recommendations(
+        ["readable_code/08_functions.md", "security/01_auth.md"],
+        {
+            "default_model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        },
+    )
+
+    assert recommendations == {
+        "readable_code/08_functions.md": {
+            "model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        },
+        "security/01_auth.md": {
+            "model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        },
+    }
 
 
 def test_persist_shadow_recommendation_decision_applies_when_approved(tmp_path):
