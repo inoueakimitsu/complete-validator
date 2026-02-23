@@ -1541,9 +1541,20 @@ def build_reverse_python_import_map(file_contents: dict[str, str]) -> dict[str, 
     return reverse
 
 
-def expand_reverse_dependencies(changed_files: set[str], reverse_map: dict[str, set[str]]) -> set[str]:
+def expand_reverse_dependencies(
+    changed_files: set[str],
+    reverse_map: dict[str, set[str]],
+    transitive: bool = True,
+) -> set[str]:
     """reverse dependency map を使って、変更ファイルに依存するファイル集合を返します。"""
     impacted = set(changed_files)
+    if not changed_files:
+        return impacted
+    if not transitive:
+        for changed in changed_files:
+            impacted.update(reverse_map.get(changed, set()))
+        return impacted
+
     queue = list(changed_files)
     while queue:
         current = queue.pop(0)
@@ -1567,7 +1578,7 @@ def resolve_cross_file_targets(
 
     has_python_cross_file = any(
         bool(options.get("cross_file"))
-        and (str(options.get("dependency_scope", "")).strip().lower() in ("", "python_imports"))
+        and (str(options.get("dependency_scope", "")).strip().lower() in ("", "python_imports", "python_imports_direct"))
         for _name, _patterns, _body, options in rules
     )
     if not has_python_cross_file:
@@ -1593,8 +1604,20 @@ def resolve_cross_file_targets(
 
     reverse_map = build_reverse_python_import_map(contents)
     changed_python = {p for p in target_files if p.endswith(".py")}
-    impacted = expand_reverse_dependencies(changed_python, reverse_map)
-    return set(target_files) | impacted
+    scopes = {
+        str(options.get("dependency_scope", "")).strip().lower()
+        for _name, _patterns, _body, options in rules
+        if bool(options.get("cross_file"))
+    }
+    needs_transitive = ("" in scopes) or ("python_imports" in scopes)
+    needs_direct = "python_imports_direct" in scopes
+
+    expanded = set(target_files)
+    if needs_direct:
+        expanded |= expand_reverse_dependencies(changed_python, reverse_map, transitive=False)
+    if needs_transitive:
+        expanded |= expand_reverse_dependencies(changed_python, reverse_map, transitive=True)
+    return expanded
 
 
 def _rule_target_pool(
@@ -1607,7 +1630,7 @@ def _rule_target_pool(
     if not bool(rule_options.get("cross_file", False)):
         return target_files
     scope = str(rule_options.get("dependency_scope", "")).strip().lower()
-    if scope not in ("", "python_imports"):
+    if scope not in ("", "python_imports", "python_imports_direct"):
         return target_files
     return sorted(cross_file_targets)
 

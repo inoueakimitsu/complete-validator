@@ -86,18 +86,30 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
     monkeypatch.setattr(
         harness,
         "discover_rule_keys_for_recommendation",
-        lambda _root: ["readable_code/08_functions.md"],
+        lambda _root: ["readable_code/08_functions.md", "security/01_auth.md"],
     )
 
     def fake_run_static(config_path, fixture_filter, runner_cfg, recorded, record=False, sanitize_recordings=False):
         if config_path.stem == "baseline":
             return (
                 {"f1": 0.80, "disruption_rate": 0.10, "precision": 0.8, "recall": 0.8, "tp": 8, "fp": 2, "fn": 2, "tn": 8},
-                {"timing": {"wall_time": 2.0, "llm_calls": 20}},
+                {
+                    "timing": {"wall_time": 2.0, "llm_calls": 20},
+                    "rule_metrics": {
+                        "readable_code/08_functions.md": {"f1": 0.70, "disruption_rate": 0.20, "support": 8},
+                        "security/01_auth.md": {"f1": 0.90, "disruption_rate": 0.10, "support": 8},
+                    },
+                },
             )
         return (
             {"f1": 0.85, "disruption_rate": 0.12, "precision": 0.85, "recall": 0.85, "tp": 9, "fp": 2, "fn": 1, "tn": 8},
-            {"timing": {"wall_time": 1.5, "llm_calls": 12}},
+            {
+                "timing": {"wall_time": 1.5, "llm_calls": 12},
+                "rule_metrics": {
+                    "readable_code/08_functions.md": {"f1": 0.72, "disruption_rate": 0.18, "support": 8},
+                    "security/01_auth.md": {"f1": 0.70, "disruption_rate": 0.30, "support": 8},
+                },
+            },
         )
 
     monkeypatch.setattr(harness, "run_static", fake_run_static)
@@ -206,6 +218,41 @@ def test_build_rule_recommendations_uses_candidate_runtime_config():
             "batching": True,
             "cache": False,
         },
+    }
+
+
+def test_build_rule_recommendations_filters_by_rule_level_guardrails():
+    harness = _load_test_harness_module()
+    recommendations = harness.build_rule_recommendations(
+        ["readable_code/08_functions.md", "security/01_auth.md", "docs/01_style.md"],
+        {
+            "default_model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        },
+        current_rule_metrics={
+            "readable_code/08_functions.md": {"f1": 0.70, "disruption_rate": 0.20, "support": 8},
+            "security/01_auth.md": {"f1": 0.90, "disruption_rate": 0.10, "support": 8},
+            "docs/01_style.md": {"f1": 0.50, "disruption_rate": 0.05, "support": 1},
+        },
+        candidate_rule_metrics={
+            "readable_code/08_functions.md": {"f1": 0.72, "disruption_rate": 0.18, "support": 8},
+            "security/01_auth.md": {"f1": 0.80, "disruption_rate": 0.12, "support": 8},
+            "docs/01_style.md": {"f1": 0.90, "disruption_rate": 0.01, "support": 1},
+        },
+        max_f1_drop=0.01,
+        max_disruption_increase=0.01,
+        min_support=2,
+    )
+
+    assert recommendations == {
+        "readable_code/08_functions.md": {
+            "model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        }
     }
 
 

@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from evaluator import aggregate_metrics, evaluate_fixture
-from fixture_manager import FixtureManager
+from fixture_manager import FixtureManager, read_annotations
 from reporter import emit_summary, print_comparison, print_summary
 from runner import CheckResult, RunnerConfig
 
@@ -342,6 +342,95 @@ def _sanitize_recorded_payload(payload: dict) -> dict:
     return sanitized
 
 
+def _predict_status_for_rule(rule_results: list[dict], rule_name: str) -> str:
+    for item in rule_results:
+        if item.get("rule") != rule_name:
+            continue
+        status = str(item.get("status", "allow")).lower()
+        if status in {"deny", "error"}:
+            return "unsatisfied"
+        return "satisfied"
+    return "satisfied"
+
+
+def _normalize_expected_status(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    if value in {"allow", "satisfy", "satisfied"}:
+        return "satisfied"
+    if value in {"deny", "unsatisfied", "violation"}:
+        return "unsatisfied"
+    if value == "irrelevant":
+        return "irrelevant"
+    return value or "satisfied"
+
+
+def _evaluate_rule_metrics_for_fixture(fixture, rule_results: list[dict]) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for ann in read_annotations(fixture):
+        rule_name = str(ann.get("rule", "")).strip()
+        if not rule_name:
+            continue
+        expected = _normalize_expected_status(str(ann.get("expected", "satisfied")))
+        if expected == "irrelevant":
+            continue
+        predicted = _predict_status_for_rule(rule_results, rule_name)
+
+        bucket = counts.setdefault(rule_name, {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "support": 0})
+        bucket["support"] += 1
+        if expected == "satisfied" and predicted == "satisfied":
+            bucket["tn"] += 1
+        elif expected == "satisfied" and predicted == "unsatisfied":
+            bucket["fp"] += 1
+        elif expected == "unsatisfied" and predicted == "satisfied":
+            bucket["fn"] += 1
+        elif expected == "unsatisfied" and predicted == "unsatisfied":
+            bucket["tp"] += 1
+    return counts
+
+
+def _merge_rule_metric_counts(
+    total: dict[str, dict[str, int]],
+    incoming: dict[str, dict[str, int]],
+) -> None:
+    for rule_name, part in incoming.items():
+        bucket = total.setdefault(rule_name, {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "support": 0})
+        for key in ("tp", "fp", "fn", "tn", "support"):
+            bucket[key] += int(part.get(key, 0))
+
+
+def _finalize_rule_metrics(counts: dict[str, dict[str, int]]) -> dict[str, dict[str, float]]:
+    finalized: dict[str, dict[str, float]] = {}
+    for rule_name in sorted(counts.keys()):
+        bucket = counts[rule_name]
+        tp = int(bucket.get("tp", 0))
+        fp = int(bucket.get("fp", 0))
+        fn = int(bucket.get("fn", 0))
+        tn = int(bucket.get("tn", 0))
+        support = int(bucket.get("support", 0))
+
+        precision_denom = tp + fp
+        recall_denom = tp + fn
+        precision = tp / precision_denom if precision_denom else 0.0
+        recall = tp / recall_denom if recall_denom else 0.0
+        f1_denom = precision + recall
+        f1 = (2 * precision * recall / f1_denom) if f1_denom else 0.0
+        disruption_denom = fp + tn
+        disruption_rate = fp / disruption_denom if disruption_denom else 0.0
+
+        finalized[rule_name] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "disruption_rate": disruption_rate,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "tn": tn,
+            "support": support,
+        }
+    return finalized
+
+
 def run_static(
     config_path: Path,
     fixture_filter: list[str] | None,
@@ -365,6 +454,7 @@ def run_static(
         "llm_calls": 0,
     }
     all_rule_results = []
+    rule_metric_counts: dict[str, dict[str, int]] = {}
 
     from runner import run_check_once
 
@@ -401,6 +491,8 @@ def run_static(
                 "exit_code": run_result.exit_code,
             },
         )
+        fixture_rule_counts = _evaluate_rule_metrics_for_fixture(fixture, run_result.rule_results)
+        _merge_rule_metric_counts(rule_metric_counts, fixture_rule_counts)
         if record:
             recorded_path = fixture.path / f"recorded_{mode}.json"
             recorded_payload = {
@@ -427,6 +519,7 @@ def run_static(
         "fixtures": all_rule_results,
         "metric": agg,
         "timing": timing,
+        "rule_metrics": _finalize_rule_metrics(rule_metric_counts),
     }
     return agg, details
 
@@ -1020,7 +1113,16 @@ def discover_rule_keys_for_recommendation(root: Path) -> list[str]:
     return keys
 
 
-def build_rule_recommendations(rule_keys: list[str], candidate_runtime_config: dict) -> dict[str, dict]:
+def build_rule_recommendations(
+    rule_keys: list[str],
+    candidate_runtime_config: dict,
+    *,
+    current_rule_metrics: dict[str, dict] | None = None,
+    candidate_rule_metrics: dict[str, dict] | None = None,
+    max_f1_drop: float = 0.0,
+    max_disruption_increase: float = 0.0,
+    min_support: int = 1,
+) -> dict[str, dict]:
     if not rule_keys:
         return {}
     updates: dict[str, object] = {}
@@ -1037,7 +1139,36 @@ def build_rule_recommendations(rule_keys: list[str], candidate_runtime_config: d
 
     if not updates:
         return {}
-    return {rule_key: dict(updates) for rule_key in rule_keys}
+
+    if not isinstance(current_rule_metrics, dict) or not isinstance(candidate_rule_metrics, dict):
+        return {rule_key: dict(updates) for rule_key in rule_keys}
+
+    recommendations: dict[str, dict] = {}
+    min_required_support = max(1, int(min_support))
+    for rule_key in rule_keys:
+        current = current_rule_metrics.get(rule_key, {})
+        candidate = candidate_rule_metrics.get(rule_key, {})
+        if not isinstance(current, dict) or not isinstance(candidate, dict):
+            continue
+
+        current_support = int(current.get("support", 0))
+        candidate_support = int(candidate.get("support", 0))
+        if max(current_support, candidate_support) < min_required_support:
+            continue
+
+        current_f1 = float(current.get("f1", 0.0))
+        candidate_f1 = float(candidate.get("f1", 0.0))
+        current_disruption = float(current.get("disruption_rate", 0.0))
+        candidate_disruption = float(candidate.get("disruption_rate", 0.0))
+
+        f1_drop = current_f1 - candidate_f1
+        disruption_increase = candidate_disruption - current_disruption
+        if f1_drop > float(max_f1_drop):
+            continue
+        if disruption_increase > float(max_disruption_increase):
+            continue
+        recommendations[rule_key] = dict(updates)
+    return recommendations
 
 
 def evaluate_shadow_recommendation(
@@ -1353,7 +1484,15 @@ def main() -> None:
     )
     candidate_runtime_config = load_runtime_config_for_recommendation(config_paths[1])
     rule_keys = discover_rule_keys_for_recommendation(root)
-    rule_recommendations = build_rule_recommendations(rule_keys, candidate_runtime_config)
+    rule_recommendations = build_rule_recommendations(
+        rule_keys,
+        candidate_runtime_config,
+        current_rule_metrics=base_detail.get("rule_metrics", {}),
+        candidate_rule_metrics=opt_detail.get("rule_metrics", {}),
+        max_f1_drop=args.regression_max_drop,
+        max_disruption_increase=args.regression_max_disruption_increase,
+        min_support=2,
+    )
 
     recommendation = persist_shadow_recommendation(
         root=root,
