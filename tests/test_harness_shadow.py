@@ -343,3 +343,141 @@ def test_persist_shadow_recommendation_decision_stays_pending_without_approval(t
     payload = json.loads(out_path.read_text(encoding="utf-8"))
     assert payload["decision"]["status"] == "pending_approval"
     assert not (tmp_path / ".complete-validator" / "rule-config.json").exists()
+
+
+def test_build_rule_recommendations_uses_evidence_metrics_and_excludes_rejected_evidence():
+    harness = _load_test_harness_module()
+    evidence_summary = {}
+    recommendations = harness.build_rule_recommendations(
+        ["readable_code/08_functions.md", "security/01_auth.md"],
+        {
+            "default_model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        },
+        current_rule_metrics={
+            "readable_code/08_functions.md": {"f1": 0.8, "disruption_rate": 0.1, "support": 10},
+            "security/01_auth.md": {"f1": 0.8, "disruption_rate": 0.1, "support": 10},
+        },
+        candidate_rule_metrics={
+            "readable_code/08_functions.md": {"f1": 0.8, "disruption_rate": 0.1, "support": 10},
+            "security/01_auth.md": {"f1": 0.8, "disruption_rate": 0.1, "support": 10},
+        },
+        current_evidence_metrics={
+            "readable_code/08_functions.md#expected_unsatisfied:auth-token": {
+                "f1": 0.70,
+                "disruption_rate": 0.20,
+                "support": 3,
+            },
+            "security/01_auth.md#expected_unsatisfied:access-control": {
+                "f1": 0.95,
+                "disruption_rate": 0.05,
+                "support": 3,
+            },
+        },
+        candidate_evidence_metrics={
+            "readable_code/08_functions.md#expected_unsatisfied:auth-token": {
+                "f1": 0.75,
+                "disruption_rate": 0.15,
+                "support": 3,
+            },
+            "security/01_auth.md#expected_unsatisfied:access-control": {
+                "f1": 0.70,
+                "disruption_rate": 0.20,
+                "support": 3,
+            },
+        },
+        max_f1_drop=0.01,
+        max_disruption_increase=0.01,
+        min_support=2,
+        min_evidence_support=2,
+        evidence_summary=evidence_summary,
+    )
+
+    assert recommendations == {
+        "readable_code/08_functions.md": {
+            "model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        }
+    }
+    assert evidence_summary["accepted"] == ["readable_code/08_functions.md#expected_unsatisfied:auth-token"]
+    assert evidence_summary["rejected"] == ["security/01_auth.md#expected_unsatisfied:access-control"]
+    assert evidence_summary["insufficient_support"] == []
+
+
+def test_build_rule_recommendations_falls_back_to_rule_metrics_when_evidence_insufficient():
+    harness = _load_test_harness_module()
+    evidence_summary = {}
+    recommendations = harness.build_rule_recommendations(
+        ["readable_code/08_functions.md"],
+        {
+            "default_model": "haiku",
+            "context_level": "smart",
+            "batching": True,
+            "cache": False,
+        },
+        current_rule_metrics={"readable_code/08_functions.md": {"f1": 0.70, "disruption_rate": 0.20, "support": 8}},
+        candidate_rule_metrics={"readable_code/08_functions.md": {"f1": 0.72, "disruption_rate": 0.18, "support": 8}},
+        current_evidence_metrics={
+            "readable_code/08_functions.md#expected_unsatisfied:tiny": {
+                "f1": 0.70,
+                "disruption_rate": 0.20,
+                "support": 1,
+            }
+        },
+        candidate_evidence_metrics={
+            "readable_code/08_functions.md#expected_unsatisfied:tiny": {
+                "f1": 0.72,
+                "disruption_rate": 0.18,
+                "support": 1,
+            }
+        },
+        max_f1_drop=0.01,
+        max_disruption_increase=0.01,
+        min_support=2,
+        min_evidence_support=2,
+        evidence_summary=evidence_summary,
+    )
+
+    assert "readable_code/08_functions.md" in recommendations
+    assert evidence_summary["accepted"] == []
+    assert evidence_summary["rejected"] == []
+    assert evidence_summary["insufficient_support"] == [
+        "readable_code/08_functions.md#expected_unsatisfied:tiny"
+    ]
+
+
+def test_persist_shadow_recommendation_includes_evidence_summary(tmp_path):
+    harness = _load_test_harness_module()
+    harness.persist_shadow_recommendation(
+        root=tmp_path,
+        scenario="static",
+        current_name="baseline",
+        current_metrics={"f1": 0.9, "disruption_rate": 0.1},
+        current_timing={"wall_time": 10.0, "llm_calls": 20},
+        candidate_name="optimized",
+        candidate_metrics={"f1": 0.9, "disruption_rate": 0.1},
+        candidate_timing={"wall_time": 8.0, "llm_calls": 15},
+        rule_recommendations={"readable_code/08_functions.md": {"model": "haiku"}},
+        evidence_summary={
+            "accepted": ["readable_code/08_functions.md#expected_unsatisfied:auth-token"],
+            "rejected": [],
+            "insufficient_support": [],
+        },
+        max_f1_drop=0.05,
+        max_disruption_increase=0.1,
+    )
+
+    out_path = (
+        tmp_path
+        / "tests"
+        / "results"
+        / "shadow_recommendation_static__baseline_vs_optimized.json"
+    )
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload["evidence_summary"]["accepted"] == [
+        "readable_code/08_functions.md#expected_unsatisfied:auth-token"
+    ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import keyword
 import os
@@ -353,6 +354,13 @@ def _predict_status_for_rule(rule_results: list[dict], rule_name: str) -> str:
     return "satisfied"
 
 
+def _find_rule_result(rule_results: list[dict], rule_name: str) -> dict:
+    for item in rule_results:
+        if item.get("rule") == rule_name:
+            return item if isinstance(item, dict) else {}
+    return {}
+
+
 def _normalize_expected_status(raw: str) -> str:
     value = (raw or "").strip().lower()
     if value in {"allow", "satisfy", "satisfied"}:
@@ -364,8 +372,45 @@ def _normalize_expected_status(raw: str) -> str:
     return value or "satisfied"
 
 
-def _evaluate_rule_metrics_for_fixture(fixture, rule_results: list[dict]) -> dict[str, dict[str, int]]:
+_EVIDENCE_STOPWORDS = {
+    "the",
+    "and",
+    "with",
+    "for",
+    "this",
+    "that",
+    "line",
+    "rule",
+    "file",
+    "must",
+    "should",
+    "return",
+    "deny",
+    "allow",
+}
+
+
+def _normalize_evidence_category(annotation: dict, expected: str, message: str) -> str:
+    explicit = annotation.get("evidence_category")
+    if isinstance(explicit, str) and explicit.strip():
+        normalized = re.sub(r"[^a-z0-9_:-]+", "-", explicit.strip().lower()).strip("-")
+        if normalized:
+            return normalized
+    tokens = re.findall(r"[a-z0-9_]+", (message or "").lower())
+    compact = [token for token in tokens if token not in _EVIDENCE_STOPWORDS and not token.isdigit() and len(token) > 2]
+    if not compact:
+        return f"expected_{expected}:generic"
+    joined = " ".join(compact[:8]).encode("utf-8")
+    digest = hashlib.sha1(joined).hexdigest()[:8]
+    return f"expected_{expected}:{digest}"
+
+
+def _evaluate_rule_and_evidence_metrics_for_fixture(
+    fixture,
+    rule_results: list[dict],
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
     counts: dict[str, dict[str, int]] = {}
+    evidence_counts: dict[str, dict[str, int]] = {}
     for ann in read_annotations(fixture):
         rule_name = str(ann.get("rule", "")).strip()
         if not rule_name:
@@ -374,18 +419,31 @@ def _evaluate_rule_metrics_for_fixture(fixture, rule_results: list[dict]) -> dic
         if expected == "irrelevant":
             continue
         predicted = _predict_status_for_rule(rule_results, rule_name)
+        matched = _find_rule_result(rule_results, rule_name)
+        message = str(matched.get("message", "")) if isinstance(matched, dict) else ""
+        evidence_category = _normalize_evidence_category(ann, expected, message)
+        evidence_key = f"{rule_name}#{evidence_category}"
 
         bucket = counts.setdefault(rule_name, {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "support": 0})
+        evidence_bucket = evidence_counts.setdefault(
+            evidence_key,
+            {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "support": 0},
+        )
         bucket["support"] += 1
+        evidence_bucket["support"] += 1
         if expected == "satisfied" and predicted == "satisfied":
             bucket["tn"] += 1
+            evidence_bucket["tn"] += 1
         elif expected == "satisfied" and predicted == "unsatisfied":
             bucket["fp"] += 1
+            evidence_bucket["fp"] += 1
         elif expected == "unsatisfied" and predicted == "satisfied":
             bucket["fn"] += 1
+            evidence_bucket["fn"] += 1
         elif expected == "unsatisfied" and predicted == "unsatisfied":
             bucket["tp"] += 1
-    return counts
+            evidence_bucket["tp"] += 1
+    return counts, evidence_counts
 
 
 def _merge_rule_metric_counts(
@@ -455,6 +513,7 @@ def run_static(
     }
     all_rule_results = []
     rule_metric_counts: dict[str, dict[str, int]] = {}
+    evidence_metric_counts: dict[str, dict[str, int]] = {}
 
     from runner import run_check_once
 
@@ -491,8 +550,12 @@ def run_static(
                 "exit_code": run_result.exit_code,
             },
         )
-        fixture_rule_counts = _evaluate_rule_metrics_for_fixture(fixture, run_result.rule_results)
+        fixture_rule_counts, fixture_evidence_counts = _evaluate_rule_and_evidence_metrics_for_fixture(
+            fixture,
+            run_result.rule_results,
+        )
         _merge_rule_metric_counts(rule_metric_counts, fixture_rule_counts)
+        _merge_rule_metric_counts(evidence_metric_counts, fixture_evidence_counts)
         if record:
             recorded_path = fixture.path / f"recorded_{mode}.json"
             recorded_payload = {
@@ -520,6 +583,7 @@ def run_static(
         "metric": agg,
         "timing": timing,
         "rule_metrics": _finalize_rule_metrics(rule_metric_counts),
+        "evidence_metrics": _finalize_rule_metrics(evidence_metric_counts),
     }
     return agg, details
 
@@ -1119,9 +1183,13 @@ def build_rule_recommendations(
     *,
     current_rule_metrics: dict[str, dict] | None = None,
     candidate_rule_metrics: dict[str, dict] | None = None,
+    current_evidence_metrics: dict[str, dict] | None = None,
+    candidate_evidence_metrics: dict[str, dict] | None = None,
     max_f1_drop: float = 0.0,
     max_disruption_increase: float = 0.0,
     min_support: int = 1,
+    min_evidence_support: int = 1,
+    evidence_summary: dict[str, list[str]] | None = None,
 ) -> dict[str, dict]:
     if not rule_keys:
         return {}
@@ -1140,12 +1208,64 @@ def build_rule_recommendations(
     if not updates:
         return {}
 
+    if isinstance(evidence_summary, dict):
+        evidence_summary["accepted"] = []
+        evidence_summary["rejected"] = []
+        evidence_summary["insufficient_support"] = []
+
+    accepted_evidence: list[str] = []
+    rejected_evidence: list[str] = []
+    insufficient_evidence: list[str] = []
+
+    evidence_by_rule: dict[str, list[str]] = {}
+    if isinstance(current_evidence_metrics, dict) and isinstance(candidate_evidence_metrics, dict):
+        for evidence_key in sorted(current_evidence_metrics.keys()):
+            if "#" not in evidence_key:
+                continue
+            if evidence_key not in candidate_evidence_metrics:
+                continue
+            rule_key, _category = evidence_key.split("#", 1)
+            if not rule_key:
+                continue
+            evidence_by_rule.setdefault(rule_key, []).append(evidence_key)
+
     if not isinstance(current_rule_metrics, dict) or not isinstance(candidate_rule_metrics, dict):
         return {rule_key: dict(updates) for rule_key in rule_keys}
 
     recommendations: dict[str, dict] = {}
     min_required_support = max(1, int(min_support))
+    min_required_evidence_support = max(1, int(min_evidence_support))
     for rule_key in rule_keys:
+        evidence_keys = evidence_by_rule.get(rule_key, [])
+        if evidence_keys:
+            has_accepted = False
+            has_rejected = False
+            has_comparable = False
+            for evidence_key in evidence_keys:
+                current_ev = current_evidence_metrics.get(evidence_key, {})
+                candidate_ev = candidate_evidence_metrics.get(evidence_key, {})
+                if not isinstance(current_ev, dict) or not isinstance(candidate_ev, dict):
+                    continue
+                support = max(int(current_ev.get("support", 0)), int(candidate_ev.get("support", 0)))
+                if support < min_required_evidence_support:
+                    insufficient_evidence.append(evidence_key)
+                    continue
+                has_comparable = True
+                f1_drop = float(current_ev.get("f1", 0.0)) - float(candidate_ev.get("f1", 0.0))
+                disruption_increase = float(candidate_ev.get("disruption_rate", 0.0)) - float(
+                    current_ev.get("disruption_rate", 0.0)
+                )
+                if f1_drop <= float(max_f1_drop) and disruption_increase <= float(max_disruption_increase):
+                    has_accepted = True
+                    accepted_evidence.append(evidence_key)
+                else:
+                    has_rejected = True
+                    rejected_evidence.append(evidence_key)
+            if has_comparable:
+                if has_accepted and not has_rejected:
+                    recommendations[rule_key] = dict(updates)
+                continue
+
         current = current_rule_metrics.get(rule_key, {})
         candidate = candidate_rule_metrics.get(rule_key, {})
         if not isinstance(current, dict) or not isinstance(candidate, dict):
@@ -1168,6 +1288,11 @@ def build_rule_recommendations(
         if disruption_increase > float(max_disruption_increase):
             continue
         recommendations[rule_key] = dict(updates)
+
+    if isinstance(evidence_summary, dict):
+        evidence_summary["accepted"] = sorted(accepted_evidence)
+        evidence_summary["rejected"] = sorted(rejected_evidence)
+        evidence_summary["insufficient_support"] = sorted(insufficient_evidence)
     return recommendations
 
 
@@ -1233,6 +1358,7 @@ def persist_shadow_recommendation(
     candidate_metrics: dict[str, float],
     candidate_timing: dict[str, float],
     rule_recommendations: dict[str, dict] | None = None,
+    evidence_summary: dict[str, list[str]] | None = None,
     *,
     max_f1_drop: float,
     max_disruption_increase: float,
@@ -1255,6 +1381,12 @@ def persist_shadow_recommendation(
         "candidate_config": candidate_name,
         "recommendation": recommendation,
     }
+    if isinstance(evidence_summary, dict):
+        payload["evidence_summary"] = {
+            "accepted": list(evidence_summary.get("accepted", [])),
+            "rejected": list(evidence_summary.get("rejected", [])),
+            "insufficient_support": list(evidence_summary.get("insufficient_support", [])),
+        }
     out_path = (
         root / "tests" / "results" / f"shadow_recommendation_{scenario}__{current_name}_vs_{candidate_name}.json"
     )
@@ -1484,14 +1616,19 @@ def main() -> None:
     )
     candidate_runtime_config = load_runtime_config_for_recommendation(config_paths[1])
     rule_keys = discover_rule_keys_for_recommendation(root)
+    evidence_summary: dict[str, list[str]] = {}
     rule_recommendations = build_rule_recommendations(
         rule_keys,
         candidate_runtime_config,
         current_rule_metrics=base_detail.get("rule_metrics", {}),
         candidate_rule_metrics=opt_detail.get("rule_metrics", {}),
+        current_evidence_metrics=base_detail.get("evidence_metrics", {}),
+        candidate_evidence_metrics=opt_detail.get("evidence_metrics", {}),
         max_f1_drop=args.regression_max_drop,
         max_disruption_increase=args.regression_max_disruption_increase,
         min_support=2,
+        min_evidence_support=2,
+        evidence_summary=evidence_summary,
     )
 
     recommendation = persist_shadow_recommendation(
@@ -1504,6 +1641,7 @@ def main() -> None:
         candidate_metrics=optimized,
         candidate_timing=opt_detail.get("timing", {}),
         rule_recommendations=rule_recommendations,
+        evidence_summary=evidence_summary,
         max_f1_drop=args.regression_max_drop,
         max_disruption_increase=args.regression_max_disruption_increase,
     )
