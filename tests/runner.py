@@ -72,7 +72,7 @@ def _parse_rule_results(stdout: str, stderr: str) -> list[dict[str, Any]]:
                 "rule": match.group("rule").strip(),
                 "status": status,
                 "file": match.group("file").strip(),
-                "message": match.group(0),
+                "message": block.strip(),
             }
         )
     return parsed

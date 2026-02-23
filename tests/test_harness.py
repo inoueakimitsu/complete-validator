@@ -408,9 +408,10 @@ def _normalize_evidence_category(annotation: dict, expected: str, message: str) 
 def _evaluate_rule_and_evidence_metrics_for_fixture(
     fixture,
     rule_results: list[dict],
-) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]], dict[str, list[dict]]]:
     counts: dict[str, dict[str, int]] = {}
     evidence_counts: dict[str, dict[str, int]] = {}
+    evidence_samples: dict[str, list[dict]] = {}
     for ann in read_annotations(fixture):
         rule_name = str(ann.get("rule", "")).strip()
         if not rule_name:
@@ -423,6 +424,17 @@ def _evaluate_rule_and_evidence_metrics_for_fixture(
         message = str(matched.get("message", "")) if isinstance(matched, dict) else ""
         evidence_category = _normalize_evidence_category(ann, expected, message)
         evidence_key = f"{rule_name}#{evidence_category}"
+        sample_list = evidence_samples.setdefault(evidence_key, [])
+        if len(sample_list) < 20:
+            sample_list.append(
+                {
+                    "fixture": fixture.name,
+                    "file": str(matched.get("file", "")) if isinstance(matched, dict) else "",
+                    "expected": expected,
+                    "predicted": predicted,
+                    "message": message,
+                }
+            )
 
         bucket = counts.setdefault(rule_name, {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "support": 0})
         evidence_bucket = evidence_counts.setdefault(
@@ -443,7 +455,7 @@ def _evaluate_rule_and_evidence_metrics_for_fixture(
         elif expected == "unsatisfied" and predicted == "unsatisfied":
             bucket["tp"] += 1
             evidence_bucket["tp"] += 1
-    return counts, evidence_counts
+    return counts, evidence_counts, evidence_samples
 
 
 def _merge_rule_metric_counts(
@@ -514,6 +526,7 @@ def run_static(
     all_rule_results = []
     rule_metric_counts: dict[str, dict[str, int]] = {}
     evidence_metric_counts: dict[str, dict[str, int]] = {}
+    evidence_samples: dict[str, list[dict]] = {}
 
     from runner import run_check_once
 
@@ -550,12 +563,22 @@ def run_static(
                 "exit_code": run_result.exit_code,
             },
         )
-        fixture_rule_counts, fixture_evidence_counts = _evaluate_rule_and_evidence_metrics_for_fixture(
+        (
+            fixture_rule_counts,
+            fixture_evidence_counts,
+            fixture_evidence_samples,
+        ) = _evaluate_rule_and_evidence_metrics_for_fixture(
             fixture,
             run_result.rule_results,
         )
         _merge_rule_metric_counts(rule_metric_counts, fixture_rule_counts)
         _merge_rule_metric_counts(evidence_metric_counts, fixture_evidence_counts)
+        for evidence_key, samples in fixture_evidence_samples.items():
+            bucket = evidence_samples.setdefault(evidence_key, [])
+            for sample in samples:
+                if len(bucket) >= 20:
+                    break
+                bucket.append(sample)
         if record:
             recorded_path = fixture.path / f"recorded_{mode}.json"
             recorded_payload = {
@@ -584,6 +607,7 @@ def run_static(
         "timing": timing,
         "rule_metrics": _finalize_rule_metrics(rule_metric_counts),
         "evidence_metrics": _finalize_rule_metrics(evidence_metric_counts),
+        "evidence_samples": evidence_samples,
     }
     return agg, details
 
@@ -1189,7 +1213,6 @@ def build_rule_recommendations(
     max_disruption_increase: float = 0.0,
     min_support: int = 1,
     min_evidence_support: int = 1,
-    evidence_summary: dict[str, list[str]] | None = None,
 ) -> dict[str, dict]:
     if not rule_keys:
         return {}
@@ -1207,15 +1230,6 @@ def build_rule_recommendations(
 
     if not updates:
         return {}
-
-    if isinstance(evidence_summary, dict):
-        evidence_summary["accepted"] = []
-        evidence_summary["rejected"] = []
-        evidence_summary["insufficient_support"] = []
-
-    accepted_evidence: list[str] = []
-    rejected_evidence: list[str] = []
-    insufficient_evidence: list[str] = []
 
     evidence_by_rule: dict[str, list[str]] = {}
     if isinstance(current_evidence_metrics, dict) and isinstance(candidate_evidence_metrics, dict):
@@ -1248,7 +1262,6 @@ def build_rule_recommendations(
                     continue
                 support = max(int(current_ev.get("support", 0)), int(candidate_ev.get("support", 0)))
                 if support < min_required_evidence_support:
-                    insufficient_evidence.append(evidence_key)
                     continue
                 has_comparable = True
                 f1_drop = float(current_ev.get("f1", 0.0)) - float(candidate_ev.get("f1", 0.0))
@@ -1257,10 +1270,8 @@ def build_rule_recommendations(
                 )
                 if f1_drop <= float(max_f1_drop) and disruption_increase <= float(max_disruption_increase):
                     has_accepted = True
-                    accepted_evidence.append(evidence_key)
                 else:
                     has_rejected = True
-                    rejected_evidence.append(evidence_key)
             if has_comparable:
                 if has_accepted and not has_rejected:
                     recommendations[rule_key] = dict(updates)
@@ -1289,11 +1300,76 @@ def build_rule_recommendations(
             continue
         recommendations[rule_key] = dict(updates)
 
-    if isinstance(evidence_summary, dict):
-        evidence_summary["accepted"] = sorted(accepted_evidence)
-        evidence_summary["rejected"] = sorted(rejected_evidence)
-        evidence_summary["insufficient_support"] = sorted(insufficient_evidence)
     return recommendations
+
+
+def build_evidence_comparison(
+    current_evidence_metrics: dict[str, dict] | None,
+    candidate_evidence_metrics: dict[str, dict] | None,
+    *,
+    max_f1_drop: float,
+    max_disruption_increase: float,
+    min_evidence_support: int,
+    current_evidence_samples: dict[str, list[dict]] | None = None,
+    candidate_evidence_samples: dict[str, list[dict]] | None = None,
+) -> list[dict]:
+    if not isinstance(current_evidence_metrics, dict) or not isinstance(candidate_evidence_metrics, dict):
+        return []
+
+    out: list[dict] = []
+    for evidence_key in sorted(current_evidence_metrics.keys()):
+        if evidence_key not in candidate_evidence_metrics:
+            continue
+        current = current_evidence_metrics.get(evidence_key, {})
+        candidate = candidate_evidence_metrics.get(evidence_key, {})
+        if not isinstance(current, dict) or not isinstance(candidate, dict):
+            continue
+
+        rule_key = ""
+        if "#" in evidence_key:
+            rule_key = evidence_key.split("#", 1)[0]
+
+        current_f1 = float(current.get("f1", 0.0))
+        candidate_f1 = float(candidate.get("f1", 0.0))
+        current_disruption = float(current.get("disruption_rate", 0.0))
+        candidate_disruption = float(candidate.get("disruption_rate", 0.0))
+        entry = {
+            "evidence_key": evidence_key,
+            "rule_key": rule_key,
+            "current": {
+                "tp": int(current.get("tp", 0)),
+                "fp": int(current.get("fp", 0)),
+                "fn": int(current.get("fn", 0)),
+                "tn": int(current.get("tn", 0)),
+                "support": int(current.get("support", 0)),
+                "f1": current_f1,
+                "disruption_rate": current_disruption,
+            },
+            "candidate": {
+                "tp": int(candidate.get("tp", 0)),
+                "fp": int(candidate.get("fp", 0)),
+                "fn": int(candidate.get("fn", 0)),
+                "tn": int(candidate.get("tn", 0)),
+                "support": int(candidate.get("support", 0)),
+                "f1": candidate_f1,
+                "disruption_rate": candidate_disruption,
+            },
+            "delta": {
+                "f1_drop": current_f1 - candidate_f1,
+                "disruption_increase": candidate_disruption - current_disruption,
+            },
+            "threshold_ref": {
+                "max_f1_drop": float(max_f1_drop),
+                "max_disruption_increase": float(max_disruption_increase),
+                "min_evidence_support": int(max(1, min_evidence_support)),
+            },
+            "samples": {
+                "current": list((current_evidence_samples or {}).get(evidence_key, [])),
+                "candidate": list((candidate_evidence_samples or {}).get(evidence_key, [])),
+            },
+        }
+        out.append(entry)
+    return out
 
 
 def evaluate_shadow_recommendation(
@@ -1358,7 +1434,7 @@ def persist_shadow_recommendation(
     candidate_metrics: dict[str, float],
     candidate_timing: dict[str, float],
     rule_recommendations: dict[str, dict] | None = None,
-    evidence_summary: dict[str, list[str]] | None = None,
+    evidence_comparison: list[dict] | None = None,
     *,
     max_f1_drop: float,
     max_disruption_increase: float,
@@ -1381,12 +1457,8 @@ def persist_shadow_recommendation(
         "candidate_config": candidate_name,
         "recommendation": recommendation,
     }
-    if isinstance(evidence_summary, dict):
-        payload["evidence_summary"] = {
-            "accepted": list(evidence_summary.get("accepted", [])),
-            "rejected": list(evidence_summary.get("rejected", [])),
-            "insufficient_support": list(evidence_summary.get("insufficient_support", [])),
-        }
+    if isinstance(evidence_comparison, list):
+        payload["evidence_comparison"] = evidence_comparison
     out_path = (
         root / "tests" / "results" / f"shadow_recommendation_{scenario}__{current_name}_vs_{candidate_name}.json"
     )
@@ -1616,7 +1688,6 @@ def main() -> None:
     )
     candidate_runtime_config = load_runtime_config_for_recommendation(config_paths[1])
     rule_keys = discover_rule_keys_for_recommendation(root)
-    evidence_summary: dict[str, list[str]] = {}
     rule_recommendations = build_rule_recommendations(
         rule_keys,
         candidate_runtime_config,
@@ -1628,7 +1699,15 @@ def main() -> None:
         max_disruption_increase=args.regression_max_disruption_increase,
         min_support=2,
         min_evidence_support=2,
-        evidence_summary=evidence_summary,
+    )
+    evidence_comparison = build_evidence_comparison(
+        base_detail.get("evidence_metrics", {}),
+        opt_detail.get("evidence_metrics", {}),
+        max_f1_drop=args.regression_max_drop,
+        max_disruption_increase=args.regression_max_disruption_increase,
+        min_evidence_support=2,
+        current_evidence_samples=base_detail.get("evidence_samples", {}),
+        candidate_evidence_samples=opt_detail.get("evidence_samples", {}),
     )
 
     recommendation = persist_shadow_recommendation(
@@ -1641,7 +1720,7 @@ def main() -> None:
         candidate_metrics=optimized,
         candidate_timing=opt_detail.get("timing", {}),
         rule_recommendations=rule_recommendations,
-        evidence_summary=evidence_summary,
+        evidence_comparison=evidence_comparison,
         max_f1_drop=args.regression_max_drop,
         max_disruption_increase=args.regression_max_disruption_increase,
     )

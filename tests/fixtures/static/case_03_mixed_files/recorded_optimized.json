@@ -1,21 +1,21 @@
 {
   "fixture": "case_03_mixed_files",
   "mode": "optimized",
-  "generated_at": 1771725809,
+  "generated_at": 1771848776,
   "exit_code": 0,
-  "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nNo violations found.\n",
+  "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nChecking `util.py` against all rules in the checklist.\n\n---\n\n**Rule: Naming style (`readable_code/02_naming.md`)**\n\n- `sanitize` — conventional, intent is clear. Not flagged.\n- `value` — conventional parameter name, intent is clear. Not flagged.\n\n---\n\nNo violations found.\n",
   "stderr": "",
   "rule_results": [
     {
       "rule": "readable_code/02_naming.md",
       "status": "allow",
       "file": "util.py",
-      "message": "[Rule: readable_code/02_naming.md | File: util.py]"
+      "message": "[Rule: readable_code/02_naming.md | File: util.py]\nChecking `util.py` against all rules in the checklist.\n\n---\n\n**Rule: Naming style (`readable_code/02_naming.md`)**\n\n- `sanitize` — conventional, intent is clear. Not flagged.\n- `value` — conventional parameter name, intent is clear. Not flagged.\n\n---\n\nNo violations found."
     }
   ],
   "raw": {
     "exit_code": 0,
-    "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nNo violations found.\n",
+    "stdout": "[Validator Result]\n[Rule: readable_code/02_naming.md | File: util.py]\nChecking `util.py` against all rules in the checklist.\n\n---\n\n**Rule: Naming style (`readable_code/02_naming.md`)**\n\n- `sanitize` — conventional, intent is clear. Not flagged.\n- `value` — conventional parameter name, intent is clear. Not flagged.\n\n---\n\nNo violations found.\n",
     "stderr": "",
     "config_path": "tests/configs/optimized.json"
   }

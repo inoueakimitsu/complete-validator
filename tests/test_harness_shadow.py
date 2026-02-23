@@ -347,7 +347,6 @@ def test_persist_shadow_recommendation_decision_stays_pending_without_approval(t
 
 def test_build_rule_recommendations_uses_evidence_metrics_and_excludes_rejected_evidence():
     harness = _load_test_harness_module()
-    evidence_summary = {}
     recommendations = harness.build_rule_recommendations(
         ["readable_code/08_functions.md", "security/01_auth.md"],
         {
@@ -392,7 +391,6 @@ def test_build_rule_recommendations_uses_evidence_metrics_and_excludes_rejected_
         max_disruption_increase=0.01,
         min_support=2,
         min_evidence_support=2,
-        evidence_summary=evidence_summary,
     )
 
     assert recommendations == {
@@ -403,14 +401,8 @@ def test_build_rule_recommendations_uses_evidence_metrics_and_excludes_rejected_
             "cache": False,
         }
     }
-    assert evidence_summary["accepted"] == ["readable_code/08_functions.md#expected_unsatisfied:auth-token"]
-    assert evidence_summary["rejected"] == ["security/01_auth.md#expected_unsatisfied:access-control"]
-    assert evidence_summary["insufficient_support"] == []
-
-
 def test_build_rule_recommendations_falls_back_to_rule_metrics_when_evidence_insufficient():
     harness = _load_test_harness_module()
-    evidence_summary = {}
     recommendations = harness.build_rule_recommendations(
         ["readable_code/08_functions.md"],
         {
@@ -439,18 +431,75 @@ def test_build_rule_recommendations_falls_back_to_rule_metrics_when_evidence_ins
         max_disruption_increase=0.01,
         min_support=2,
         min_evidence_support=2,
-        evidence_summary=evidence_summary,
     )
 
     assert "readable_code/08_functions.md" in recommendations
-    assert evidence_summary["accepted"] == []
-    assert evidence_summary["rejected"] == []
-    assert evidence_summary["insufficient_support"] == [
-        "readable_code/08_functions.md#expected_unsatisfied:tiny"
-    ]
+
+def test_build_evidence_comparison_writes_raw_metrics():
+    harness = _load_test_harness_module()
+    comparison = harness.build_evidence_comparison(
+        {
+            "readable_code/08_functions.md#expected_unsatisfied:auth-token": {
+                "tp": 3,
+                "fp": 1,
+                "fn": 0,
+                "tn": 4,
+                "support": 4,
+                "f1": 0.86,
+                "disruption_rate": 0.2,
+            }
+        },
+        {
+            "readable_code/08_functions.md#expected_unsatisfied:auth-token": {
+                "tp": 2,
+                "fp": 2,
+                "fn": 1,
+                "tn": 3,
+                "support": 4,
+                "f1": 0.57,
+                "disruption_rate": 0.4,
+            }
+        },
+        max_f1_drop=0.05,
+        max_disruption_increase=0.1,
+        min_evidence_support=1,
+        current_evidence_samples={
+            "readable_code/08_functions.md#expected_unsatisfied:auth-token": [
+                {
+                    "fixture": "case_01",
+                    "file": "app.py",
+                    "expected": "unsatisfied",
+                    "predicted": "unsatisfied",
+                    "message": "token check missing",
+                }
+            ]
+        },
+        candidate_evidence_samples={
+            "readable_code/08_functions.md#expected_unsatisfied:auth-token": [
+                {
+                    "fixture": "case_01",
+                    "file": "app.py",
+                    "expected": "unsatisfied",
+                    "predicted": "satisfied",
+                    "message": "missed token check",
+                }
+            ]
+        },
+    )
+    assert len(comparison) == 1
+    row = comparison[0]
+    assert row["evidence_key"] == "readable_code/08_functions.md#expected_unsatisfied:auth-token"
+    assert row["rule_key"] == "readable_code/08_functions.md"
+    assert row["current"]["support"] == 4
+    assert row["candidate"]["support"] == 4
+    assert row["delta"]["f1_drop"] == 0.29000000000000004
+    assert row["delta"]["disruption_increase"] == 0.2
+    assert row["threshold_ref"]["min_evidence_support"] == 1
+    assert row["samples"]["current"][0]["fixture"] == "case_01"
+    assert row["samples"]["candidate"][0]["predicted"] == "satisfied"
 
 
-def test_persist_shadow_recommendation_includes_evidence_summary(tmp_path):
+def test_persist_shadow_recommendation_includes_evidence_comparison(tmp_path):
     harness = _load_test_harness_module()
     harness.persist_shadow_recommendation(
         root=tmp_path,
@@ -462,15 +511,23 @@ def test_persist_shadow_recommendation_includes_evidence_summary(tmp_path):
         candidate_metrics={"f1": 0.9, "disruption_rate": 0.1},
         candidate_timing={"wall_time": 8.0, "llm_calls": 15},
         rule_recommendations={"readable_code/08_functions.md": {"model": "haiku"}},
-        evidence_summary={
-            "accepted": ["readable_code/08_functions.md#expected_unsatisfied:auth-token"],
-            "rejected": [],
-            "insufficient_support": [],
-        },
+        evidence_comparison=[
+            {
+                "evidence_key": "readable_code/08_functions.md#expected_unsatisfied:auth-token",
+                "rule_key": "readable_code/08_functions.md",
+                "current": {"support": 3, "f1": 0.8, "disruption_rate": 0.2, "tp": 0, "fp": 0, "fn": 0, "tn": 0},
+                "candidate": {"support": 3, "f1": 0.7, "disruption_rate": 0.3, "tp": 0, "fp": 0, "fn": 0, "tn": 0},
+                "delta": {"f1_drop": 0.1, "disruption_increase": 0.1},
+                "threshold_ref": {
+                    "max_f1_drop": 0.05,
+                    "max_disruption_increase": 0.1,
+                    "min_evidence_support": 2,
+                },
+            }
+        ],
         max_f1_drop=0.05,
         max_disruption_increase=0.1,
     )
-
     out_path = (
         tmp_path
         / "tests"
@@ -478,6 +535,7 @@ def test_persist_shadow_recommendation_includes_evidence_summary(tmp_path):
         / "shadow_recommendation_static__baseline_vs_optimized.json"
     )
     payload = json.loads(out_path.read_text(encoding="utf-8"))
-    assert payload["evidence_summary"]["accepted"] == [
+    assert "evidence_summary" not in payload
+    assert payload["evidence_comparison"][0]["evidence_key"] == (
         "readable_code/08_functions.md#expected_unsatisfied:auth-token"
-    ]
+    )
