@@ -318,6 +318,94 @@ def test_watch_priority_from_recent_queue_returns_normal_without_matches(tmp_pat
     assert priority == check_style.WATCH_PRIORITY_NORMAL
 
 
+def test_watch_effective_queue_max_shrinks_when_result_quality_is_high():
+    check_style = _load_check_style_module()
+
+    high = check_style._watch_effective_queue_max(
+        base_queue_max=8,
+        result_quality_priority=check_style.WATCH_PRIORITY_HIGH,
+        high_ratio=0.5,
+        medium_ratio=0.75,
+    )
+    medium = check_style._watch_effective_queue_max(
+        base_queue_max=8,
+        result_quality_priority=check_style.WATCH_PRIORITY_MEDIUM,
+        high_ratio=0.5,
+        medium_ratio=0.75,
+    )
+    normal = check_style._watch_effective_queue_max(
+        base_queue_max=8,
+        result_quality_priority=check_style.WATCH_PRIORITY_NORMAL,
+        high_ratio=0.5,
+        medium_ratio=0.75,
+    )
+
+    assert high == 4
+    assert medium == 6
+    assert normal == 8
+
+
+def test_run_watch_mode_passes_effective_queue_max_to_enqueue(monkeypatch):
+    check_style = _load_check_style_module()
+    args = argparse.Namespace(
+        staged=False,
+        full_scan=False,
+        plugin_dir=None,
+        watch=True,
+        watch_interval_seconds=0.1,
+        watch_debounce_seconds=0.0,
+        watch_max_runs=1,
+        watch_queue_max=8,
+        watch_reinsert_delay_seconds=2.0,
+        watch_history_ttl_seconds=3600,
+        watch_backpressure_high_ratio=0.5,
+        watch_backpressure_medium_ratio=0.75,
+        stream=False,
+        stream_worker=False,
+    )
+
+    monkeypatch.setattr(
+        check_style,
+        "resolve_target_files",
+        lambda staged, full_scan: (["a.py"], {"a.py": "diff-1"}),
+    )
+    monkeypatch.setattr(check_style, "_repository_root", lambda: Path("/tmp"))
+    monkeypatch.setattr(check_style, "find_project_rules_dirs", lambda: [])
+    monkeypatch.setattr(check_style, "merge_rules", lambda builtin_dir, project_dirs: ([], []))
+    monkeypatch.setattr(check_style, "_watch_priority_from_diff", lambda diff: check_style.WATCH_PRIORITY_NORMAL)
+    monkeypatch.setattr(check_style, "_watch_priority_from_rule_severity", lambda files, rules: check_style.WATCH_PRIORITY_NORMAL)
+    monkeypatch.setattr(check_style, "_watch_priority_from_recent_queue", lambda root, files: check_style.WATCH_PRIORITY_NORMAL)
+    monkeypatch.setattr(check_style, "_watch_priority_from_history_stats", lambda root, files, ttl: check_style.WATCH_PRIORITY_NORMAL)
+    monkeypatch.setattr(check_style, "_watch_priority_from_history_trend", lambda root, files, ttl: check_style.WATCH_PRIORITY_NORMAL)
+    monkeypatch.setattr(check_style, "_watch_priority_from_result_quality", lambda root, files, ttl: check_style.WATCH_PRIORITY_HIGH)
+    monkeypatch.setattr(check_style, "_update_watch_priority_stats", lambda root, files, priority: None)
+    monkeypatch.setattr(check_style.time, "sleep", lambda _x: None)
+    monkeypatch.setattr(check_style.time, "monotonic", lambda: 1.0)
+    monkeypatch.setattr(check_style.subprocess, "run", lambda *args, **kwargs: argparse.Namespace(returncode=0, stdout="", stderr=""))
+
+    captured = {"queue_max": None}
+
+    def fake_restore(pending_queue, delayed_queue, now, queue_max):
+        captured["queue_max"] = queue_max
+
+    def fake_enqueue(**kwargs):
+        captured["queue_max"] = kwargs.get("queue_max")
+        kwargs["pending_queue"].append(
+            {
+                "signature": kwargs.get("signature", ""),
+                "enqueued_at": kwargs.get("now", 0.0),
+                "priority": kwargs.get("priority", check_style.WATCH_PRIORITY_NORMAL),
+            }
+        )
+
+    monkeypatch.setattr(check_style, "_watch_restore_delayed_signatures", fake_restore)
+    monkeypatch.setattr(check_style, "_watch_enqueue_signature", fake_enqueue)
+
+    check_style.run_watch_mode(args)
+
+    assert captured["queue_max"] == 4
+
+
 def test_watch_priority_from_result_quality_escalates_on_high_pending_ratio(tmp_path):
     check_style = _load_check_style_module()
     results_dir, _queue_dir = check_style._violations_dir(tmp_path)

@@ -17,6 +17,7 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -83,6 +84,8 @@ DEFAULT_WATCH_TREND_WINDOW_SECONDS = 1800
 DEFAULT_WATCH_TREND_THRESHOLD_MEDIUM = 3
 DEFAULT_WATCH_TREND_THRESHOLD_HIGH = 6
 DEFAULT_WATCH_RESULT_QUALITY_WINDOW = 20
+DEFAULT_WATCH_BACKPRESSURE_HIGH_RATIO = 0.5
+DEFAULT_WATCH_BACKPRESSURE_MEDIUM_RATIO = 0.75
 WATCH_PRIORITY_HIGH = 0
 WATCH_PRIORITY_MEDIUM = 1
 WATCH_PRIORITY_NORMAL = 2
@@ -2148,6 +2151,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_WATCH_HISTORY_TTL_SECONDS,
         help="watch 優先度履歴を参照する有効期間 (秒)。",
     )
+    parser.add_argument(
+        "--watch-backpressure-high-ratio",
+        type=float,
+        default=DEFAULT_WATCH_BACKPRESSURE_HIGH_RATIO,
+        help="実検出結果が high 優先度のときに watch queue 上限へ掛ける比率 (0-1)。",
+    )
+    parser.add_argument(
+        "--watch-backpressure-medium-ratio",
+        type=float,
+        default=DEFAULT_WATCH_BACKPRESSURE_MEDIUM_RATIO,
+        help="実検出結果が medium 優先度のときに watch queue 上限へ掛ける比率 (0-1)。",
+    )
     return parser.parse_args()
 
 
@@ -2362,6 +2377,23 @@ def _watch_priority_from_result_quality(
     return WATCH_PRIORITY_NORMAL
 
 
+def _watch_effective_queue_max(
+    base_queue_max: int,
+    result_quality_priority: int,
+    *,
+    high_ratio: float,
+    medium_ratio: float,
+) -> int:
+    base = max(1, int(base_queue_max))
+    clamped_high = min(1.0, max(0.1, float(high_ratio)))
+    clamped_medium = min(1.0, max(0.1, float(medium_ratio)))
+    if int(result_quality_priority) <= WATCH_PRIORITY_HIGH:
+        return max(1, int(math.ceil(base * clamped_high)))
+    if int(result_quality_priority) <= WATCH_PRIORITY_MEDIUM:
+        return max(1, int(math.ceil(base * clamped_medium)))
+    return base
+
+
 def _update_watch_priority_stats(root: Path, target_files: list[str], priority: int) -> None:
     if not target_files:
         return
@@ -2499,6 +2531,12 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     queue_max = max(1, int(args.watch_queue_max))
     reinsert_delay = max(0.1, float(args.watch_reinsert_delay_seconds))
     history_ttl = max(0, int(args.watch_history_ttl_seconds))
+    high_ratio = float(
+        getattr(args, "watch_backpressure_high_ratio", DEFAULT_WATCH_BACKPRESSURE_HIGH_RATIO)
+    )
+    medium_ratio = float(
+        getattr(args, "watch_backpressure_medium_ratio", DEFAULT_WATCH_BACKPRESSURE_MEDIUM_RATIO)
+    )
 
     command = build_watch_check_command(args)
     root = _repository_root()
@@ -2513,23 +2551,30 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     while True:
         target_files, diff_chunks = resolve_target_files(args.staged, full_scan=False)
         current_signature = _watch_signature(target_files, diff_chunks)
+        result_quality_priority = _watch_priority_from_result_quality(root, target_files, history_ttl)
         current_priority = min(
             _watch_priority_from_diff(diff_chunks),
             _watch_priority_from_rule_severity(target_files, rules),
             _watch_priority_from_recent_queue(root, target_files),
-            _watch_priority_from_result_quality(root, target_files, history_ttl),
+            result_quality_priority,
             _watch_priority_from_history_stats(root, target_files, history_ttl),
             _watch_priority_from_history_trend(root, target_files, history_ttl),
         )
+        effective_queue_max = _watch_effective_queue_max(
+            queue_max,
+            result_quality_priority,
+            high_ratio=high_ratio,
+            medium_ratio=medium_ratio,
+        )
         _update_watch_priority_stats(root, target_files, current_priority)
         now = time.monotonic()
-        _watch_restore_delayed_signatures(pending_queue, delayed_queue, now, queue_max)
+        _watch_restore_delayed_signatures(pending_queue, delayed_queue, now, effective_queue_max)
         _watch_enqueue_signature(
             pending_queue=pending_queue,
             delayed_queue=delayed_queue,
             signature=current_signature,
             now=now,
-            queue_max=queue_max,
+            queue_max=effective_queue_max,
             reinsert_delay=reinsert_delay,
             last_applied_signature=last_applied_signature,
             priority=current_priority,
