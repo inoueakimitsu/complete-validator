@@ -24,6 +24,16 @@ staged された変更に対してルール チェックを行い、違反があ
 
 commit 前に任意のタイミングでバリデーションを実行できます。
 
+### 実行モードの既定方針 (重要)
+
+- 通常運用では **stream モードを既定** とします。
+- 理由:
+  - 検出と修正を並行できるため、全体の壁時計時間を短縮できる。
+  - `claim/resolve` による排他制御を使って安全に逐次修正できる。
+  - 大きい差分や full scan でもタイムアウト回避しやすい。
+- 例外:
+  - 変更がごく少数で「一発で結果だけ見たい」場合のみ非 stream 実行を選んでよい。
+
 ```bash
 # working (unstaged) な変更をチェック (デフォルト)
 python3 scripts/check_style.py
@@ -54,7 +64,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --plugin-dir ${
 
 バックグラウンドで per-file のバリデーションを実行し、結果をポーリングしながら逐次修正できるモードです。ルール数やファイル数が多い場合に、hook の 600 秒タイムアウトを回避しつつ効率的にチェックできます。
 
-### ワークフロー
+### 標準ワークフロー (通常はこれを実行)
 
 1. ストリーム チェックを開始して stream-id を取得します。
 
@@ -71,7 +81,35 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --full-scan --stream --plug
 
 stream-id が stdout に出力されます。バックグラウンドでワーカーが起動し、ルール × ファイルの各ペアを並列チェックします。
 
-2. status.json をポーリングして進捗を確認します。
+2. queue から未処理 violation を取得します。
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --list-violations <stream-id> --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+```
+
+3. 取得したエントリを 1 件 claim します。
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --claim <stream-id> <violation-id> --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+```
+
+`claim` の返り値 JSON から `claim_uuid` と `state_version` を必ず保持します。
+
+4. violation を修正します。長時間作業中は lease を heartbeat で延長します。
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --heartbeat <stream-id> <violation-id> --claim-uuid <claim_uuid> --state-version <state_version> --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+```
+
+5. 修正完了後に resolve します (CAS)。
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --resolve <stream-id> <violation-id> --claim-uuid <claim_uuid> --state-version <state_version> --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+```
+
+6. `--list-violations` を再実行し、未処理が 0 になるまで 2-5 を繰り返します。
+
+7. 補助として `status.json` / `results` を確認します。
 
 ```bash
 cat .complete-validator/stream-results/<stream-id>/status.json
@@ -91,6 +129,34 @@ cat .complete-validator/stream-results/<stream-id>/results/*.json
 4. 修正後に再チェックします。キャッシュ ヒットした箇所は即座に完了するため、修正した箇所のみが再実行されます。
 
 5. 全結果が allow になったら commit します。hook 側は per-file キャッシュの preflight により高速パスで通過します。
+
+### 最小 consumer ループ例
+
+```bash
+STREAM_ID="$(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --stream --staged --plugin-dir ${CLAUDE_PLUGIN_ROOT})"
+
+while true; do
+  LIST_JSON="$(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --list-violations "$STREAM_ID" --plugin-dir ${CLAUDE_PLUGIN_ROOT})"
+  COUNT="$(printf '%s' "$LIST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("count", 0))')"
+  [ "$COUNT" -eq 0 ] && break
+
+  VID="$(printf '%s' "$LIST_JSON" | python3 -c 'import json,sys; e=json.load(sys.stdin).get("entries",[]); print(e[0]["violation_id"] if e else "")')"
+  [ -z "$VID" ] && sleep 1 && continue
+
+  CLAIM_JSON="$(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --claim "$STREAM_ID" "$VID" --plugin-dir ${CLAUDE_PLUGIN_ROOT})" || continue
+  CUUID="$(printf '%s' "$CLAIM_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("claim_uuid",""))')"
+  SVER="$(printf '%s' "$CLAIM_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state_version",0))')"
+  [ -z "$CUUID" ] && continue
+
+  # ここで対象ファイルを修正する
+
+  python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_style.py --resolve "$STREAM_ID" "$VID" --claim-uuid "$CUUID" --state-version "$SVER" --plugin-dir ${CLAUDE_PLUGIN_ROOT}
+done
+```
+
+注意:
+- `claim_uuid/state_version` が一致しない resolve は失敗します。
+- 他 worker が同じファイルを処理中の場合、claim は拒否されます。別 violation を処理します。
 
 ## 偽陽性の抑制 (suppressions)
 
