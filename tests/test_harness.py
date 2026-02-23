@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         default="static",
         help="scenario pair to compare in regression",
     )
+    parser.add_argument(
+        "--approve-shadow-recommendation",
+        action="store_true",
+        help="apply adopted shadow recommendation to .complete-validator/rule-config.json",
+    )
     return parser.parse_args()
 
 
@@ -1074,6 +1079,95 @@ def persist_shadow_recommendation(
         root / "tests" / "results" / f"shadow_recommendation_{scenario}__{current_name}_vs_{candidate_name}.json"
     )
     emit_summary(payload, str(out_path))
+    return recommendation
+
+
+def persist_shadow_recommendation_decision(
+    root: Path,
+    scenario: str,
+    current_name: str,
+    candidate_name: str,
+    recommendation: dict,
+    *,
+    approve: bool,
+) -> None:
+    status = "rejected"
+    if bool(recommendation.get("adopt_candidate", False)):
+        status = "applied" if approve else "pending_approval"
+
+    decision_payload = {
+        "scenario": "shadow_recommendation_decision",
+        "base_scenario": scenario,
+        "current_config": current_name,
+        "candidate_config": candidate_name,
+        "decision": {
+            "status": status,
+            "approve_requested": bool(approve),
+            "adopt_candidate": bool(recommendation.get("adopt_candidate", False)),
+        },
+        "recommendation": recommendation,
+    }
+
+    if status == "applied":
+        config_dir = root / ".complete-validator"
+        config_path = config_dir / "rule-config.json"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        if config_path.exists():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        else:
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        if not isinstance(config.get("rules"), dict):
+            config["rules"] = {}
+        if not isinstance(config.get("decision_log"), list):
+            config["decision_log"] = []
+        if not isinstance(config.get("version"), int):
+            config["version"] = 1
+
+        rule_key = "__harness__/selected_profile"
+        config["rules"][rule_key] = {
+            "selected_config": candidate_name,
+            "current_config": current_name,
+            "base_scenario": scenario,
+            "source": "shadow_recommendation",
+        }
+        rule_recommendations = recommendation.get("rule_recommendations", {})
+        if isinstance(rule_recommendations, dict):
+            for candidate_rule_key, candidate_updates in rule_recommendations.items():
+                if not isinstance(candidate_rule_key, str) or not candidate_rule_key.strip():
+                    continue
+                if not isinstance(candidate_updates, dict):
+                    continue
+                existing = config["rules"].get(candidate_rule_key, {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                merged = dict(existing)
+                merged.update(candidate_updates)
+                config["rules"][candidate_rule_key] = merged
+        config["decision_log"].append(
+            {
+                "decision_id": f"shadow-{int(time.time())}",
+                "rule_key": rule_key,
+                "changed_by": "shadow_recommendation",
+                "reason": "approved shadow recommendation in harness",
+                "metrics_snapshot": recommendation.get("deltas", {}),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "updates": config["rules"][rule_key],
+            }
+        )
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    out_path = (
+        root
+        / "tests"
+        / "results"
+        / f"shadow_recommendation_decision_{scenario}__{current_name}_vs_{candidate_name}.json"
+    )
+    emit_summary(decision_payload, str(out_path))
 
 
 def main() -> None:
@@ -1208,7 +1302,7 @@ def main() -> None:
         candidate_metrics=optimized,
         candidate_timing=opt_detail.get("timing", {}),
     )
-    persist_shadow_recommendation(
+    recommendation = persist_shadow_recommendation(
         root=root,
         scenario=args.scenario,
         current_name=config_paths[0].stem,
@@ -1219,6 +1313,14 @@ def main() -> None:
         candidate_timing=opt_detail.get("timing", {}),
         max_f1_drop=args.regression_max_drop,
         max_disruption_increase=args.regression_max_disruption_increase,
+    )
+    persist_shadow_recommendation_decision(
+        root=root,
+        scenario=args.scenario,
+        current_name=config_paths[0].stem,
+        candidate_name=config_paths[1].stem,
+        recommendation=recommendation,
+        approve=args.approve_shadow_recommendation,
     )
 
 

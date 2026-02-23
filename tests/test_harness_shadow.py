@@ -60,6 +60,8 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
         wait_seconds=120,
         max_fixpoint_iterations=3,
         oscillation_limit=1,
+        lock_unlock_hysteresis=2,
+        approve_shadow_recommendation=False,
         regression_max_drop=0.05,
         regression_max_disruption_increase=0.10,
         regression_scenario="static",
@@ -89,6 +91,7 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
 
     calls = []
     recommendation_calls = []
+    decision_calls = []
 
     def fake_persist_shadow_comparison(**kwargs):
         calls.append(kwargs)
@@ -98,6 +101,11 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
         harness,
         "persist_shadow_recommendation",
         lambda **kwargs: recommendation_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        harness,
+        "persist_shadow_recommendation_decision",
+        lambda **kwargs: decision_calls.append(kwargs),
     )
 
     harness.main()
@@ -110,6 +118,8 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
     assert recommendation_calls[0]["scenario"] == "static"
     assert recommendation_calls[0]["current_name"] == "baseline"
     assert recommendation_calls[0]["candidate_name"] == "optimized"
+    assert len(decision_calls) == 1
+    assert decision_calls[0]["approve"] is False
 
 
 def test_evaluate_shadow_recommendation_recommends_when_quality_kept_and_cost_improves():
@@ -146,3 +156,92 @@ def test_evaluate_shadow_recommendation_rejects_when_f1_drop_exceeds_guardrail()
     assert recommendation["guardrail_passed"] is False
     assert recommendation["cost_improved"] is True
     assert any("F1 dropped" in reason for reason in recommendation["reasons"])
+
+
+def test_persist_shadow_recommendation_decision_applies_when_approved(tmp_path):
+    harness = _load_test_harness_module()
+    recommendation = {
+        "adopt_candidate": True,
+        "guardrail_passed": True,
+        "cost_improved": True,
+        "rule_recommendations": {
+            "readable_code/08_functions.md": {
+                "model": "haiku",
+                "context_level": "smart",
+                "batching": True,
+                "cache": True,
+            }
+        },
+        "deltas": {
+            "f1_drop": 0.0,
+            "disruption_increase": 0.0,
+            "wall_time": -1.0,
+            "llm_calls": -5,
+        },
+        "thresholds": {"max_f1_drop": 0.05, "max_disruption_increase": 0.1},
+        "reasons": [],
+    }
+
+    harness.persist_shadow_recommendation_decision(
+        root=tmp_path,
+        scenario="static",
+        current_name="baseline",
+        candidate_name="optimized",
+        recommendation=recommendation,
+        approve=True,
+    )
+
+    out_path = (
+        tmp_path
+        / "tests"
+        / "results"
+        / "shadow_recommendation_decision_static__baseline_vs_optimized.json"
+    )
+    assert out_path.exists()
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload["decision"]["status"] == "applied"
+
+    config_path = tmp_path / ".complete-validator" / "rule-config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "__harness__/selected_profile" in config["rules"]
+    assert config["rules"]["__harness__/selected_profile"]["selected_config"] == "optimized"
+    assert "readable_code/08_functions.md" in config["rules"]
+    assert config["rules"]["readable_code/08_functions.md"]["model"] == "haiku"
+    assert config["rules"]["readable_code/08_functions.md"]["context_level"] == "smart"
+    assert len(config["decision_log"]) == 1
+
+
+def test_persist_shadow_recommendation_decision_stays_pending_without_approval(tmp_path):
+    harness = _load_test_harness_module()
+    recommendation = {
+        "adopt_candidate": True,
+        "guardrail_passed": True,
+        "cost_improved": True,
+        "deltas": {
+            "f1_drop": 0.0,
+            "disruption_increase": 0.0,
+            "wall_time": -1.0,
+            "llm_calls": -5,
+        },
+        "thresholds": {"max_f1_drop": 0.05, "max_disruption_increase": 0.1},
+        "reasons": [],
+    }
+
+    harness.persist_shadow_recommendation_decision(
+        root=tmp_path,
+        scenario="static",
+        current_name="baseline",
+        candidate_name="optimized",
+        recommendation=recommendation,
+        approve=False,
+    )
+
+    out_path = (
+        tmp_path
+        / "tests"
+        / "results"
+        / "shadow_recommendation_decision_static__baseline_vs_optimized.json"
+    )
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload["decision"]["status"] == "pending_approval"
+    assert not (tmp_path / ".complete-validator" / "rule-config.json").exists()
