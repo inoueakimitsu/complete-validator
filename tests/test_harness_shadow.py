@@ -88,11 +88,17 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
     monkeypatch.setattr(harness, "print_and_persist", lambda *args, **kwargs: None)
 
     calls = []
+    recommendation_calls = []
 
     def fake_persist_shadow_comparison(**kwargs):
         calls.append(kwargs)
 
     monkeypatch.setattr(harness, "persist_shadow_comparison", fake_persist_shadow_comparison)
+    monkeypatch.setattr(
+        harness,
+        "persist_shadow_recommendation",
+        lambda **kwargs: recommendation_calls.append(kwargs),
+    )
 
     harness.main()
 
@@ -100,3 +106,43 @@ def test_main_two_configs_calls_shadow_persist(monkeypatch):
     assert calls[0]["scenario"] == "static"
     assert calls[0]["current_name"] == "baseline"
     assert calls[0]["candidate_name"] == "optimized"
+    assert len(recommendation_calls) == 1
+    assert recommendation_calls[0]["scenario"] == "static"
+    assert recommendation_calls[0]["current_name"] == "baseline"
+    assert recommendation_calls[0]["candidate_name"] == "optimized"
+
+
+def test_evaluate_shadow_recommendation_recommends_when_quality_kept_and_cost_improves():
+    harness = _load_test_harness_module()
+
+    recommendation = harness.evaluate_shadow_recommendation(
+        current_metrics={"f1": 0.90, "disruption_rate": 0.10},
+        candidate_metrics={"f1": 0.89, "disruption_rate": 0.12},
+        current_timing={"wall_time": 10.0, "llm_calls": 20},
+        candidate_timing={"wall_time": 8.0, "llm_calls": 14},
+        max_f1_drop=0.02,
+        max_disruption_increase=0.03,
+    )
+
+    assert recommendation["adopt_candidate"] is True
+    assert recommendation["guardrail_passed"] is True
+    assert recommendation["cost_improved"] is True
+    assert recommendation["reasons"] == []
+
+
+def test_evaluate_shadow_recommendation_rejects_when_f1_drop_exceeds_guardrail():
+    harness = _load_test_harness_module()
+
+    recommendation = harness.evaluate_shadow_recommendation(
+        current_metrics={"f1": 0.90, "disruption_rate": 0.10},
+        candidate_metrics={"f1": 0.80, "disruption_rate": 0.08},
+        current_timing={"wall_time": 10.0, "llm_calls": 20},
+        candidate_timing={"wall_time": 8.0, "llm_calls": 10},
+        max_f1_drop=0.02,
+        max_disruption_increase=0.03,
+    )
+
+    assert recommendation["adopt_candidate"] is False
+    assert recommendation["guardrail_passed"] is False
+    assert recommendation["cost_improved"] is True
+    assert any("F1 dropped" in reason for reason in recommendation["reasons"])

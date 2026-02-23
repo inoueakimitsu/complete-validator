@@ -990,6 +990,92 @@ def persist_shadow_comparison(
     emit_summary(payload, str(out_path))
 
 
+def evaluate_shadow_recommendation(
+    current_metrics: dict[str, float],
+    candidate_metrics: dict[str, float],
+    current_timing: dict[str, float],
+    candidate_timing: dict[str, float],
+    *,
+    max_f1_drop: float,
+    max_disruption_increase: float,
+) -> dict:
+    f1_drop = float(current_metrics.get("f1", 0.0)) - float(candidate_metrics.get("f1", 0.0))
+    disruption_increase = float(candidate_metrics.get("disruption_rate", 0.0)) - float(
+        current_metrics.get("disruption_rate", 0.0)
+    )
+    wall_time_delta = float(candidate_timing.get("wall_time", 0.0)) - float(
+        current_timing.get("wall_time", 0.0)
+    )
+    llm_calls_delta = int(candidate_timing.get("llm_calls", 0)) - int(current_timing.get("llm_calls", 0))
+
+    reasons: list[str] = []
+    guardrail_passed = True
+    if f1_drop > float(max_f1_drop):
+        guardrail_passed = False
+        reasons.append(f"F1 dropped by {f1_drop:.4f} (> {float(max_f1_drop):.4f})")
+    if disruption_increase > float(max_disruption_increase):
+        guardrail_passed = False
+        reasons.append(
+            "disruption increased by "
+            f"{disruption_increase:.4f} (> {float(max_disruption_increase):.4f})"
+        )
+
+    cost_improved = wall_time_delta < 0.0 or llm_calls_delta < 0
+    if not cost_improved:
+        reasons.append("no cost improvement: wall_time and llm_calls did not improve")
+
+    return {
+        "adopt_candidate": bool(guardrail_passed and cost_improved),
+        "guardrail_passed": bool(guardrail_passed),
+        "cost_improved": bool(cost_improved),
+        "deltas": {
+            "f1_drop": f1_drop,
+            "disruption_increase": disruption_increase,
+            "wall_time": wall_time_delta,
+            "llm_calls": llm_calls_delta,
+        },
+        "thresholds": {
+            "max_f1_drop": float(max_f1_drop),
+            "max_disruption_increase": float(max_disruption_increase),
+        },
+        "reasons": reasons,
+    }
+
+
+def persist_shadow_recommendation(
+    root: Path,
+    scenario: str,
+    current_name: str,
+    current_metrics: dict[str, float],
+    current_timing: dict[str, float],
+    candidate_name: str,
+    candidate_metrics: dict[str, float],
+    candidate_timing: dict[str, float],
+    *,
+    max_f1_drop: float,
+    max_disruption_increase: float,
+) -> None:
+    recommendation = evaluate_shadow_recommendation(
+        current_metrics=current_metrics,
+        candidate_metrics=candidate_metrics,
+        current_timing=current_timing,
+        candidate_timing=candidate_timing,
+        max_f1_drop=max_f1_drop,
+        max_disruption_increase=max_disruption_increase,
+    )
+    payload = {
+        "scenario": "shadow_recommendation",
+        "base_scenario": scenario,
+        "current_config": current_name,
+        "candidate_config": candidate_name,
+        "recommendation": recommendation,
+    }
+    out_path = (
+        root / "tests" / "results" / f"shadow_recommendation_{scenario}__{current_name}_vs_{candidate_name}.json"
+    )
+    emit_summary(payload, str(out_path))
+
+
 def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parent.parent
@@ -1121,6 +1207,18 @@ def main() -> None:
         candidate_name=config_paths[1].stem,
         candidate_metrics=optimized,
         candidate_timing=opt_detail.get("timing", {}),
+    )
+    persist_shadow_recommendation(
+        root=root,
+        scenario=args.scenario,
+        current_name=config_paths[0].stem,
+        current_metrics=baseline,
+        current_timing=base_detail.get("timing", {}),
+        candidate_name=config_paths[1].stem,
+        candidate_metrics=optimized,
+        candidate_timing=opt_detail.get("timing", {}),
+        max_f1_drop=args.regression_max_drop,
+        max_disruption_increase=args.regression_max_disruption_increase,
     )
 
 
